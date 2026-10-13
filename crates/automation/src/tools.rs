@@ -1226,7 +1226,7 @@ pub fn tools() -> Vec<ToolDef> {
             .with(schema(json!({ "doc": doc() }), &["doc"])),
         t("doc_open_revision", "Open a revision", "Open saved revision `revision` (1 = the oldest) of a document as a new, unsaved document, to see the file as it was then.")
             .with(schema(json!({ "doc": doc(), "revision": { "type": "integer", "minimum": 1 } }), &["doc", "revision"])),
-        t("doc_optimize", "Optimize PDF", "Write an optimized copy to `path` (Acrobat's PDF Optimizer). color / gray: { downsample, ppi, above_ppi, compression: jpeg|zip|retain, quality 1–100 } (defaults: downsample to 150 ppi above 225, JPEG 60). Images are measured where pages draw them and replaced only when smaller. discard_*: thumbnails (default true), alternate_images (true), tags, print_settings; flate_unencoded (true); remove_invalid_links and remove_unreferenced_dests (true); images and forms the pages list but never draw are always dropped (unused_xobjects). discard: Remove Hidden Information categories (metadata, attachments, comments, form-fields, hidden-text, hidden-layers, bookmarks, links-actions-scripts, private-data). Signed documents are refused. The open document is unchanged.")
+        t("doc_optimize", "Optimize PDF", "Write an optimized copy to `path` (Acrobat's PDF Optimizer). color / gray: { downsample, ppi, above_ppi, compression: jpeg|zip|retain, quality 1–100 } (defaults: downsample to 150 ppi above 225, JPEG 60). Images are measured where pages draw them and replaced only when smaller. discard_*: thumbnails (default true), alternate_images (true), tags, print_settings; flate_unencoded (true); remove_invalid_links and remove_unreferenced_dests (true); images and forms the pages list but never draw are always dropped (unused_xobjects). discard: Remove Hidden Information categories (metadata, attachments, comments, form-fields, hidden-text, hidden-layers, bookmarks, links-actions-scripts, private-data). Signed documents are refused. target_bytes (optional): if the copy is larger, retry with up to 5 progressively stronger image settings (downsample to at most 110, 96, 72, 54, 36 ppi with JPEG quality at most 45, 35, 28, 20, 12; applied to colour and grey images) and stop at the first copy that fits; reports target_reached, attempts and target_settings, and writes the smallest copy with target_reached false when none fits. Without it nothing changes. The open document is unchanged.")
             .cmd("optimize.advanced")
             .with(schema(
                 json!({
@@ -1234,6 +1234,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "path": { "type": "string" },
                     "color": { "type": "object" },
                     "gray": { "type": "object" },
+                    "target_bytes": { "type": "integer", "minimum": 1 },
                     "discard_thumbnails": { "type": "boolean" },
                     "discard_alternate_images": { "type": "boolean" },
                     "discard_tags": { "type": "boolean" },
