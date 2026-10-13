@@ -26,6 +26,7 @@ pub mod sanitize;
 mod tags;
 #[cfg(test)]
 mod tests;
+pub mod user_regex;
 
 use interp::{Mode, Scope, process};
 
