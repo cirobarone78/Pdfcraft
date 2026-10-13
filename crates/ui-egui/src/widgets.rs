@@ -108,6 +108,7 @@ pub fn mode_tab(ui: &mut egui::Ui, label: &str, active: bool) -> Response {
     let t = Tokens::get(ui.ctx());
     let font = if active { theme::semibold(13.5) } else { theme::medium(13.5) };
     let w = ui.fonts_mut(|f| f.layout_no_wrap(label.to_owned(), font.clone(), t.text).size().x);
+    // Keep in step with `mode_tab_width`.
     let (rect, resp) = ui.allocate_exact_size(vec2(w + 22.0, 48.0), Sense::click());
     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), active, label));
     let press = theme::Press::track(ui, &resp);
@@ -126,6 +127,12 @@ pub fn mode_tab(ui: &mut egui::Ui, label: &str, active: bool) -> Response {
         ui.painter().rect_filled(r, CornerRadius { nw: 1, ne: 1, sw: 0, se: 0 }, t.accent);
     }
     theme::hand(resp)
+}
+
+/// Width [`mode_tab`] takes for `label` (the semibold, active, form is the widest).
+pub fn mode_tab_width(ui: &egui::Ui, label: &str) -> f32 {
+    let t = Tokens::get(ui.ctx());
+    ui.fonts_mut(|f| f.layout_no_wrap(label.to_owned(), theme::semibold(13.5), t.text).size().x) + 22.0
 }
 
 /// Rounded pill button; `primary` fills with the accent.
