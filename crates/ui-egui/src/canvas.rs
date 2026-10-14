@@ -3866,7 +3866,7 @@ fn notice_bar(ui: &mut egui::Ui, t: &Tokens, icon: &str, icon_color: Color32, te
     const ROW: f32 = 28.0;
     const ICON: f32 = 16.0;
     /// Content width below which the buttons stack under the message.
-    const STACK_BELOW: f32 = 300.0;
+    const STACK_BELOW: f32 = 200.0;
     egui::Frame::NONE.fill(t.accent_soft).inner_margin(egui::Margin::symmetric(14, 7)).show(ui, |ui| {
         let width = ui.available_width();
         if width < STACK_BELOW {
