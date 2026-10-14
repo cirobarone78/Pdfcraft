@@ -4523,3 +4523,115 @@ fn copy_image_finds_a_picture_inside_form_artwork_under_text() {
     assert_eq!(d.page_image_copy_file(0, 0).unwrap(), ("jpg", jpeg));
     assert!(d.page_image_copy_file(0, 1).is_err());
 }
+
+pub(crate) fn javascript_link_fixture() -> Vec<u8> {
+    use pdfcraft_cos::{Dict, Object, PdfString};
+    let mut cos = pdfcraft_cos::Document::open(Arc::new(fixture(2))).unwrap();
+    let mut action = Dict::new();
+    action.set(b"S".to_vec(), Object::Name(b"JavaScript".to_vec()));
+    action.set(b"JS".to_vec(), Object::String(PdfString::text("choose();")));
+    let action = cos.add(action);
+    let mut ann = Dict::new();
+    ann.set(b"Type".to_vec(), Object::Name(b"Annot".to_vec()));
+    ann.set(b"Subtype".to_vec(), Object::Name(b"Link".to_vec()));
+    ann.set(b"Rect".to_vec(), Object::Array(vec![Object::Int(10), Object::Int(10), Object::Int(100), Object::Int(100)]));
+    ann.set(b"A".to_vec(), Object::Ref(action));
+    let ann = cos.add(ann);
+    let page = pdfcraft_model::pages(&cos).remove(0);
+    let mut d = page.dict;
+    d.set(b"Annots".to_vec(), Object::Array(vec![Object::Ref(ann)]));
+    cos.set(page.obj, d);
+    pdfcraft_forms::set_document_script(&mut cos, "init", Some("function choose(){console.println(event.type + ':' + event.name);this.pageNum=1;}"))
+        .unwrap();
+    pdfcraft_cos::write_incremental(&cos, &Default::default()).unwrap()
+}
+
+#[test]
+fn link_javascript_uses_document_scripts_preserves_actions_and_checks_staleness() {
+    let bytes = Arc::new(javascript_link_fixture());
+    let mut s = Session::new();
+    let id = s.open("interactive.pdf", None, bytes.clone(), None).unwrap();
+    let input = s.prepare_link_javascript(id, 0, 0).unwrap();
+    let out = input.run();
+    let out = s.finish_link_javascript(&input, out).unwrap();
+    assert_eq!(out.error, None);
+    assert_eq!(out.console, ["Link:Mouse Up"]);
+    assert_eq!(out.requests, [js::Request::GoToPage(1)]);
+    assert!(!s.get(id).unwrap().dirty);
+    let saved = s.save_bytes(id).unwrap();
+    let reloaded = s.open("saved.pdf", None, saved, None).unwrap();
+    let restored = s.prepare_link_javascript(reloaded, 0, 0).unwrap();
+    let result = restored.run();
+    assert_eq!(result.error, None);
+    assert_eq!(result.console, ["Link:Mouse Up"]);
+    s.set_javascript(false);
+    assert!(s.prepare_link_javascript(id, 0, 0).is_err());
+    assert!(s.finish_link_javascript(&input, input.run()).is_err());
+    s.set_javascript(true);
+    s.apply(id, Edit::RotatePages { pages: vec![0], degrees: 90 }).unwrap();
+    assert!(s.finish_link_javascript(&input, input.run()).is_err());
+}
+
+#[test]
+fn link_javascript_runs_for_a_read_only_document() {
+    let mut s = Session::new();
+    let id = s.open("interactive.pdf", None, Arc::new(javascript_link_fixture()), None).unwrap();
+    s.docs.iter_mut().find(|d| d.id == id).unwrap().editor = None;
+    let input = s.prepare_link_javascript(id, 0, 0).unwrap();
+    assert_eq!(s.finish_link_javascript(&input, input.run()).unwrap().error, None);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+#[ignore = "requires PDFCRAFT_JS_READONLY_PDF, an external read-only compatibility fixture"]
+fn external_pdf_javascript_actions_read_only() {
+    let path = std::env::var("PDFCRAFT_JS_READONLY_PDF").unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let mut s = Session::new();
+    let id = s.open("external.pdf", Some(path.clone()), Arc::new(before.clone()), None).unwrap();
+    let links: Vec<_> = s
+        .get(id)
+        .unwrap()
+        .info
+        .links
+        .iter()
+        .filter(|l| matches!(l.target, pdfcraft_render::LinkTarget::JavaScript(_)))
+        .map(|l| (l.page, l.index))
+        .collect();
+    assert!(!links.is_empty());
+    let mut menus = 0;
+    for (page, index) in links.iter().take(10) {
+        let input = s.prepare_link_javascript(id, *page, *index).unwrap();
+        let rx = input.start().unwrap();
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap() {
+                js::InteractiveEvent::Menu(items, reply) => {
+                    assert!(!items.is_empty());
+                    menus += 1;
+                    reply.send(None).unwrap();
+                }
+                js::InteractiveEvent::Complete(out) => {
+                    assert_eq!(out.error, None);
+                    let out = s.finish_link_javascript(&input, out).unwrap();
+                    assert!(out.requests.is_empty());
+                    break;
+                }
+            }
+        }
+    }
+    assert!(menus > 0);
+    assert!(!s.get(id).unwrap().dirty);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    eprintln!("external read-only fixture: {} JavaScript links, {} menus exercised", links.len(), menus);
+}
+
+#[cfg(windows)]
+#[test]
+fn javascript_document_paths_normalize_only_local_drive_paths() {
+    for raw in ["/C/folder/file.pdf", "/C:/folder/file.pdf", "C:/folder/file.pdf"] {
+        assert_eq!(js::resolve_javascript_document_path(None, raw).unwrap(), std::path::PathBuf::from("C:/folder/file.pdf"));
+    }
+    for raw in ["//server/share/file.pdf", "file:///C:/folder/file.pdf", "https://example.org/file.pdf"] {
+        assert!(js::resolve_javascript_document_path(None, raw).is_err());
+    }
+}

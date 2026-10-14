@@ -5717,3 +5717,32 @@ fn absolute_gotor_consent_does_not_bypass_validation_or_passwords() {
     assert_eq!(opened["document"]["encrypted"], true);
     assert_eq!(opened["destination_applied"], true);
 }
+
+#[test]
+fn link_javascript_tool_returns_menu_choice_navigation_and_permission_requests() {
+    let dir = workdir("link-javascript");
+    let script = "var c=app.popUpMenuEx.apply(app,[{cName:'Next',cReturn:'next'},{cName:'URL',cReturn:'url'},{cName:'File',cReturn:'file'}]); if(c==='next')this.pageNum=0; if(c==='url')app.launchURL('https://example.org'); if(c==='file')app.openDoc('other.pdf');";
+    let original = String::from_utf8(remote_link_pdf(script, None)).unwrap();
+    let start = original.split("startxref\n").nth(1).unwrap().lines().next().unwrap().parse::<usize>().unwrap();
+    let text = original.replace("/S /GoToR /F", "/S /JavaScript /JS");
+    let delta = text.len() - original.len();
+    let bytes = text.replace(&format!("startxref\n{start}\n"), &format!("startxref\n{}\n", start + delta)).into_bytes();
+    std::fs::write(dir.join("js.pdf"), &bytes).unwrap();
+    let mut a = auto(&dir);
+    let id = ok(&mut a, "doc_open", json!({"path":"js.pdf"}))["doc"].clone();
+    let canceled = ok(&mut a, "link_run_javascript", json!({"doc":id,"page":1,"index":1}));
+    assert_eq!(canceled["error"], Value::Null);
+    assert_eq!(canceled["requests"], json!([]));
+    assert_eq!(canceled["menus"][0][0]["return"], "next");
+    for choice in ["next", "url", "file"] {
+        let out = ok(&mut a, "link_run_javascript", json!({"doc":id,"page":1,"index":1,"menu_choices":[choice]}));
+        assert_eq!(out["error"], Value::Null);
+        assert_eq!(out["requests"].as_array().unwrap().len(), 1);
+    }
+    let invalid = ok(&mut a, "link_run_javascript", json!({"doc":id,"page":1,"index":1,"menu_choices":["forged"]}));
+    assert!(invalid["error"].is_string());
+    assert_eq!(invalid["requests"], json!([]));
+    assert_eq!(std::fs::read(dir.join("js.pdf")).unwrap(), bytes);
+    ok(&mut a, "js_enabled", json!({"enabled":false}));
+    assert!(a.call("link_run_javascript", &json!({"doc":id,"page":1,"index":1})).is_err());
+}
