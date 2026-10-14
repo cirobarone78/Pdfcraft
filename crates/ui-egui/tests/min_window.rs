@@ -36,3 +36,85 @@ fn a_wide_window_keeps_the_five_mode_tabs() {
         assert!(h.query_by_role_and_label(Role::Button, mode).is_some(), "{mode} tab");
     }
 }
+
+fn fixture(n: usize) -> Vec<u8> {
+    let mut objs: Vec<String> = vec!["<< /Type /Catalog /Pages 2 0 R >>".into()];
+    let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", 4 + 2 * i)).collect();
+    objs.push(format!("<< /Type /Pages /Kids [{}] /Count {n} /MediaBox [0 0 200 300] >>", kids.join(" ")));
+    objs.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into());
+    for i in 0..n {
+        objs.push(format!("<< /Type /Page /Parent 2 0 R /Contents {} 0 R /Resources << /Font << /F1 3 0 R >> >> >>", 5 + 2 * i));
+        let body = format!("BT /F1 24 Tf 20 150 Td (Page {}) Tj ET", i + 1);
+        objs.push(format!("<< /Length {} >>\nstream\n{body}\nendstream", body.len()));
+    }
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+    for o in offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+    out
+}
+
+fn protected(user: &str, owner: &str, permissions: i32) -> Vec<u8> {
+    protected_with(pdfcraft_cos::Algorithm::Aes256, user, owner, permissions)
+}
+
+fn protected_with(algorithm: pdfcraft_cos::Algorithm, user: &str, owner: &str, permissions: i32) -> Vec<u8> {
+    let mut doc = pdfcraft_cos::Document::open(std::sync::Arc::new(fixture(2))).unwrap();
+    doc.set_encryption(&pdfcraft_cos::NewEncryption {
+        algorithm,
+        user_password: user,
+        owner_password: owner,
+        permissions,
+        encrypt_metadata: true,
+        seed: [4; 32],
+    })
+    .unwrap();
+    pdfcraft_cos::write_full(&doc, &Default::default()).unwrap()
+}
+
+/// A narrow window: the stacked notice bar keeps both buttons inside the window and apart.
+#[test]
+fn the_stacked_notice_keeps_its_buttons_in_view() {
+    let mut h = Harness::builder().with_size(egui::vec2(MIN_WINDOW_SIZE[0], MIN_WINDOW_SIZE[1])).build_eframe(|_cc| {
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
+        app.open_bytes("locked.pdf", None, protected("", "owner", 0b0100)).unwrap();
+        app
+    });
+    h.run_steps(8);
+    let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(MIN_WINDOW_SIZE[0], MIN_WINDOW_SIZE[1]));
+    let msg = h.get_by_label_contains("This document is secured").rect();
+    let (unlock, settings) = (h.get_by_label("Unlock…").rect(), h.get_by_label("Security settings").rect());
+    for (name, r) in [("unlock", unlock), ("settings", settings)] {
+        assert!(window.contains_rect(r), "{name} stays inside the window: {r:?}");
+        assert!(r.left() >= msg.left() - 30.0, "{name} is not cut off at the bar's left edge: {r:?} vs {msg:?}");
+        assert!(r.top() >= msg.bottom() - 0.5 || r.bottom() <= msg.top() + 0.5, "{name} does not cover the message");
+    }
+    assert!(!unlock.intersects(settings), "the buttons do not overlap: {unlock:?} {settings:?}");
+}
+
+/// #1913 (1182 x 556): the rail's top buttons and its page-navigation cluster must not overlap.
+#[test]
+fn a_short_window_does_not_overlap_the_rail_clusters() {
+    let h = {
+        let mut h = Harness::builder().with_size(egui::vec2(1182.0, 556.0)).build_eframe(|_cc| {
+            let mut app = PdfCraftApp::new();
+            app.set_option("language", "en").unwrap();
+            app.open_bytes("a.pdf", None, fixture(2)).unwrap();
+            app
+        });
+        h.run_steps(8);
+        h
+    };
+    let tags = h.get_by_label("Tags").rect();
+    let next = h.get_by_label("Previous page").rect();
+    assert!(next.top() >= tags.bottom(), "page navigation sits below the rail buttons: {tags:?} vs {next:?}");
+}

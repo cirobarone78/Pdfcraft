@@ -3877,7 +3877,8 @@ fn notice_bar(ui: &mut egui::Ui, t: &Tokens, icon: &str, icon_color: Color32, te
                 icons::paint(ui, Rect::from_center_size(slot.center(), vec2(ICON, ICON)), icon, ICON, icon_color);
                 ui.add(egui::Label::new(egui::RichText::new(text).color(t.text)).wrap());
             });
-            ui.allocate_ui_with_layout(vec2(width, ROW), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // The buttons wrap onto further rows when even the full width is too narrow for them all.
+            ui.allocate_ui_with_layout(vec2(width, ROW), egui::Layout::right_to_left(egui::Align::Center).with_main_wrap(true), |ui| {
                 ui.set_min_height(ROW);
                 buttons(ui);
             });
