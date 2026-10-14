@@ -216,7 +216,7 @@ fn main() -> eframe::Result {
     // Windows: a launch that only names files (an Outlook attachment, an Explorer double-click)
     // hands them to the PdfCraft already running and exits (#282, #317). Any option means the
     // caller wants this launch's own window.
-    let may_hand_off = !new_window && !files.is_empty() && options.is_empty() && control_file.is_none() && !create_images;
+    let may_hand_off = single_instance::may_hand_off(new_window, &files, !options.is_empty(), control_file.is_some(), create_images);
     let instance = match single_instance::claim(&single_instance::absolute(&files), may_hand_off) {
         single_instance::Claim::HandedOff => return Ok(()),
         single_instance::Claim::Primary(server) => Some(server),

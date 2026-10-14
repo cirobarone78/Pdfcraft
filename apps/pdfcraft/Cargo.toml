@@ -42,12 +42,14 @@ pollster = "1.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Which GPU drives which display (EnumDisplayDevices), so the window is drawn on the GPU that
-# shows it (issue #378). Safe wrappers over Win32; only the `user` feature (which brings `kernel` with it).
-winsafe = { version = "0.0.29", default-features = false, features = ["user"] }
+# shows it (issue #378). Existing safe wrappers also query the process token and its local
+# profile for socket routing. WinRT data protection uses the windows bindings below.
+winsafe = { version = "0.0.29", default-features = false, features = ["user", "advapi", "shell"] }
 # Settings ▸ Accessibility ▸ Visual effects ▸ Animation effects (src/motion.rs), through WinRT's
 # `UISettings`, whose bindings are safe to call (winsafe's `SystemParametersInfo` is an unsafe
-# fn). Already in the tree through wgpu's DX12 backend; this adds one small namespace to it.
-windows = { version = "0.62", default-features = false, features = ["std", "UI_ViewManagement"] }
+# fn). The existing package also protects IPC envelopes to the local user with safe WinRT
+# data-protection/buffer APIs; no new package or unsafe code is needed.
+windows = { version = "0.62", default-features = false, features = ["std", "UI_ViewManagement", "Security_Cryptography_DataProtection", "Storage_Streams"] }
 # Single instance (#282): later launches hand their files to the running app over a Unix domain
 # socket. `std` has no Unix sockets on Windows, and calling Winsock directly needs unsafe, which
 # our workspace forbids. Already in the lockfile through zbus; pinned exactly, review before bumping.
