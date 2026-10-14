@@ -1,5 +1,6 @@
 # Where PdfCraft falls short of Acrobat Pro
 
+> **Last reviewed:** 2026-10-14 · **Last updated:** 2026-10-14 · **Change:** minor (M6 context menus: automated ergonomics tests pass; native acceptance blocked by local transport; estimates unchanged)
 > **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-12 · **Change:** minor (gap 6: #1398 stamps read upright on rotated pages; estimates unchanged) · **Target:** Adobe Acrobat Pro (Acrobat DC, continuous track 26.002.21931, macOS)
 > **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-12 · **Change:** minor (gap 6: #1317, #1327, #1302, #1315 and #1340; estimates unchanged) · **Target:** Adobe Acrobat Pro (Acrobat DC, continuous track 26.002.21931, macOS)
 > **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-12 · **Change:** minor (#1316: replacing a line keeps a neighbouring line whose glyph box overlaps; gap 3 remains) · **Target:** Adobe Acrobat Pro (Acrobat DC, continuous track 26.002.21931, macOS)
@@ -248,6 +249,8 @@ update the numbers.
 
 ### 15. Forms: JavaScript object model, actions, submit, XFA depth
 
+Native link action sources, Link/Mouse Up execution and popUpMenuEx continuation now have passing engine/tool regressions. The desktop menu now uses anchored, non-modal popups; egui_kittest regressions pass for placement, single-click replacement and continuation. Native after-fix acceptance remains pending: Windows local control connections began failing with OS error 10013 during verification. See [menu audit](javascript-menu-ergonomics-audit.md). Persistent document globals, lifecycle actions and the wider object model remain gaps; estimates are unchanged. See [JavaScript link actions](javascript-link-actions.md).
+
 - **Missing:** the wider Acrobat JavaScript object model (annotations, layers, dialogs), document
   actions, the Actions tab triggers that run JavaScript, form submission, the debugger, barcode
   fields, rich-text values; XFA flattening and complete dynamic-form fidelity.
@@ -324,6 +327,7 @@ update the numbers.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-14 | minor | M6 context menus anchored at activation; single-click replacement and keyboard tests pass. Native after-fix acceptance pending local Windows transport. Estimates unchanged. |
 | 2026-10-12 | minor | Gap 6: rubber stamps, explicit image rectangles and PDF-page stamps read upright on rotated pages (#1398). Estimates unchanged. |
 | 2026-10-12 | minor | #1316: replacing a line or paragraph keeps a neighbouring line whose glyph box overlaps. Gap 3 remains. Estimates unchanged. |
 | 2026-10-12 | minor | Exclusive image crops resize with their pixels across nested states, intervening operators and content streams; shared clips remain fixed. Synthetic engine/tool regressions and private image save/reopen checks; estimates unchanged. |

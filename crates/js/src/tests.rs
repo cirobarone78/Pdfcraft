@@ -1079,3 +1079,71 @@ mod session {
         assert!(o.abandoned || o.error.as_deref().is_some_and(|e| e.contains("too long")), "{o:?}");
     }
 }
+
+#[test]
+fn popup_cancellation_and_link_document_target() {
+    let e = Event { kind: "Link".into(), ..Event::doc("Mouse Up") };
+    let o = go("if (event.target !== this) throw Error('target'); app.popUpMenuEx({cName:'A',cReturn:''})", &e);
+    assert_eq!(o.error, None);
+    assert_eq!(o.result.as_deref(), Some(""));
+}
+
+#[test]
+fn document_initialization_uses_open_event() {
+    let o = run(
+        "console.println(event.type + ':' + event.name)",
+        &Event::doc("Console"),
+        &doc(),
+        &[],
+        &["if (event.name !== 'Open' || event.target !== this) throw Error('initialization'); var ready=1;".into()],
+        Limits::default(),
+    );
+    assert_eq!(o.error, None);
+    assert_eq!(o.console, ["Doc:Console"]);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn popup_resumes_same_execution_and_validates_choices() {
+    for choice in [Some("next"), None, Some("forged")] {
+        let rx = interactive("var count=1; var c=app.popUpMenuEx.apply(app,[{cName:'Group',oSubMenu:[{cName:'Next',cReturn:'next'},{cName:'Disabled',cReturn:'bad',bEnabled:false}]}]); count++; console.println(count); if(c==='next') this.pageNum=2;".into(),
+            Event { kind:"Link".into(), ..Event::doc("Mouse Up") }, doc(), vec![], vec![]).unwrap();
+        match rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap() {
+            InteractiveEvent::Menu(items, reply) => {
+                assert_eq!(items[0].children[0].value, "next");
+                assert!(!items[0].children[1].enabled);
+                reply.send(choice.map(str::to_string)).unwrap();
+            }
+            _ => panic!("menu expected"),
+        }
+        let InteractiveEvent::Complete(o) = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap() else { panic!("completion expected") };
+        if choice == Some("forged") {
+            assert!(o.error.is_some());
+        } else {
+            assert_eq!(o.error, None);
+            assert_eq!(o.console, ["2"]);
+            assert_eq!(o.requests, if choice.is_some() { vec![Request::GoToPage(2)] } else { vec![] });
+        }
+    }
+}
+
+#[test]
+fn popup_limits_and_open_doc_are_fail_closed() {
+    let o = go("var a={cName:'cycle'}; a.oSubMenu=a; app.popUpMenuEx(a)", &Event::doc("Console"));
+    assert!(o.error.is_some());
+    let o = go("app.openDoc({cPath:'relative.pdf'})", &Event::doc("Console"));
+    assert_eq!(o.error, None);
+    assert_eq!(o.requests, [Request::OpenDoc("relative.pdf".into())]);
+    let o = go("app.popUpMenuEx({cName:'blank',cReturn:''}) === null", &Event::doc("Console"));
+    assert_eq!(o.result.as_deref(), Some("true"));
+}
+
+#[test]
+fn initialization_aggregate_limit_preserves_field_value() {
+    let e = Event::field("Validate", "price", "17");
+    let scripts = vec![String::new(); 1025];
+    let o = run("", &e, &doc(), &fields(), &scripts, Limits::default());
+    assert!(o.error.is_some());
+    assert_eq!(o.value, "17");
+    assert!(o.rc);
+}

@@ -184,3 +184,11 @@ unapplied with a warning.
 `doc_batch` runs conversion, OCR and compression over files and optionally recursive
 folders. The CLI also exposes it as `pdfcraft-cli batch`. See the
 [batch guide](../../docs/cli-batch.md) for examples, output protection, errors and limits.
+
+## JavaScript link actions
+
+`link_run_javascript {doc, page, index, menu_choices?}` executes a PDF link with its document
+scripts and Link/Mouse Up event. Menus cancel unless `menu_choices` provides validated return
+strings (or null) in order. It returns menus, diagnostics and viewer requests and performs no
+external access. See [JavaScript link actions](../../docs/javascript-link-actions.md) for
+limits, native UI behavior, file-opening consent and compatibility boundaries.
