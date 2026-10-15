@@ -2,6 +2,7 @@
 
 **Stage: alpha** · next: beta, ~25% (ready for real work 50% → 75%) and ~400–700 h away
 
+> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-13 · **Change:** minor (M4: indirect page rotations; M13: CLI check visits each directory once through aliases and cycles; estimates unchanged) · **Target:** Adobe Acrobat Pro (Acrobat DC, continuous track 26.002.21931, macOS)
 > **Last reviewed:** 2026-10-13 · **Last updated:** 2026-10-14 · **Change:** minor (M14: the Italian catalog has every entry the other catalogs had and the code looks up; estimates unchanged) · **Target:** Adobe Acrobat Pro (Acrobat DC, continuous track 26.002.21931, macOS)
 > **Last reviewed:** 2026-10-14 · **Last updated:** 2026-10-14 · **Change:** minor (M3 #2080 candidate: explicit search jumps join per-tab history; rail and control-channel Back/Forward; estimates unchanged)
 > **Last reviewed:** 2026-10-13 · **Last updated:** 2026-10-13 · **Change:** minor (M4 #1910: Organize Pages opens on the current page; estimates unchanged) · **Target:** Adobe Acrobat Pro (Acrobat DC, continuous track 26.002.21931, macOS)
@@ -165,6 +166,7 @@ Ranked; detail and the full milestone table in [docs/roadmap.md](docs/roadmap.md
 - **2026-10-15 (M14, gap 24):** `misc.localization` and `misc.installers` move from planned to partial. Localization: 22 catalogs ship, but Chinese shows tofu in releases, Telugu has no release font and Arabic is not mirrored. Installers: macOS and Windows releases are signed, Linux packages are not. The Acrobat menu diff itself remains open. Estimates unchanged.
 - **2026-10-13 (G14, Vietnamese localization):** Added Vietnamese (`vi`, Tiếng Việt) as an interface and date language with a 2,591-entry catalog (`plural_none`) covering 100% of the current localizable key union (plus `theme`/`Appearance`). Locale tags `vi` / `vi-VN` / `vi_VN.UTF-8` resolve; calendar months use numeric `Tháng 1`…`12` / `tháng 1`…`12`. Native-speaker community review recorded. The twelve-language localization mean moves from ≈59% to ≈68%; weighted readiness ≈49% → ≈50%. Status stays `partial`: engine/OS details, document contents, filenames, CLI/MCP and external help stay outside the catalog by design.
 
+- **2026-10-13 (M4, indirect page rotation):** Rotation queries and edits resolve indirect integer values on pages and their page-tree ancestors. Turning a page already at 270° by 90° now saves it at 0°, including when its rotation is inherited. Synthetic full/incremental save-and-reopen tests cover nested inheritance, sibling preservation, negative/large angles and invalid-value fallback. Estimates unchanged.
 - **2026-10-12 (M6, XML field names):** AcroForm XML data export constrains generated element names to XML 1.0 NCNames, so Latin-1 names such as `Area²` and `Aµ` produce readable data files. Original PDF field names travel through the existing `xfdf:original` attribute; previously valid tags, including Greek and CJK, keep their spelling. Saved-PDF regressions cover invalid prefixes, combining letters and normalized-name collisions. Estimates unchanged.
 - **2026-10-12 (M6, CSV carriage returns):** Form-data CSV export quotes carriage returns in field names and values, so a trailing carriage return cannot turn into a record separator and disappear on reimport. Saved-PDF round-trip regressions cover CR, LF, CRLF, commas and quotes; estimates unchanged.
 - **2026-10-13 (community, M14, #1553 review):** Relative Fontconfig includes resolve beside each including config, including nested configuration selected through `FONTCONFIG_PATH`. Directory includes accept only digit-prefixed `*.conf` in lexical order. Isolated regressions reproduce both review findings; configuration size/count/depth limits, cycles, symlinked config and valid reset ordering are covered. Estimates unchanged.
@@ -490,6 +492,7 @@ Newest first: the date, what moved, and the new overall estimate.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-13 | minor | M4: rotation queries and edits resolve indirect page-tree values; inherited, negative and large rotations verified through both saves. Estimates unchanged. |
 | 2026-10-12 | minor | M6: valid AcroForm XML element names with original PDF field names preserved; saved-PDF collision and Unicode regressions. Estimates unchanged. |
 | 2026-10-12 | minor | M6: preserve carriage returns in exported CSV field names and values; saved-PDF round-trip coverage. Estimates unchanged. |
 | 2026-10-13 | minor | M4: Insert-from-file preserves source bookmarks; integration tests retained with current main. Estimates unchanged. |
