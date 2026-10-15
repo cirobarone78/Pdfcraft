@@ -170,6 +170,38 @@ fn system_fallback_covers_devanagari() {
     assert!(layout_widths(&mut fonts, DEVANAGARI).iter().all(|w| w.is_finite() && *w > 0.0));
 }
 
+/// Korean file names, titles and document text have glyphs in every family when a Hangul face is
+/// installed, though no embedded face has Hangul (#407: they drew as boxes in the tab strip and
+/// the Edit tool). Where Windows' Malgun Gothic or macOS' Apple SD Gothic Neo is present it never
+/// skips: the face's presence is not taken from the code under test.
+#[test]
+fn system_fallback_covers_hangul() {
+    const KOREAN: &str = "자주 묻는 질문 FAQ.pdf";
+    assert!(!theme::font_definitions().font_data.contains_key(theme::SYSTEM_HANGUL_FALLBACK));
+    let defs = theme::installed_font_definitions(theme::CjkPreference::Default);
+    let off = std::env::var_os("PDFCRAFT_SYSTEM_FONTS").is_some_and(|v| v == "0");
+    let windir = std::env::var_os("WINDIR").map(std::path::PathBuf::from);
+    let shipped = windir.is_some_and(|dir| dir.join("Fonts").join("malgun.ttf").is_file())
+        || std::path::Path::new("/System/Library/Fonts/AppleSDGothicNeo.ttc").is_file();
+    if off || (!shipped && !defs.font_data.contains_key(theme::SYSTEM_HANGUL_FALLBACK)) {
+        eprintln!("skipping system_fallback_covers_hangul: no installed Hangul fallback font (or PDFCRAFT_SYSTEM_FONTS=0)");
+        assert!(defs.families.values().all(|stack| !stack.iter().any(|n| n == theme::SYSTEM_HANGUL_FALLBACK)));
+        return;
+    }
+    for (family, stack) in &defs.families {
+        assert_eq!(stack.iter().filter(|n| *n == theme::SYSTEM_HANGUL_FALLBACK).count(), 1, "{family:?}: {stack:?}");
+        // The general installed face stays the last fallback (it is chosen for other scripts).
+        if let Some(general) = stack.iter().position(|n| n == theme::SYSTEM_FALLBACK) {
+            assert_eq!(general + 1, stack.len(), "{family:?}: {stack:?}");
+        }
+    }
+    let mut fonts = Fonts::new(TextOptions::default(), defs);
+    for id in families() {
+        assert!(fonts.has_glyphs(&id, KOREAN), "{id:?} lacks {KOREAN}");
+    }
+    assert!(layout_widths(&mut fonts, KOREAN).iter().all(|w| w.is_finite() && *w > 0.0));
+}
+
 /// On a machine with an installed Telugu font, the installed definitions include it and Telugu
 /// text has glyphs, so the language's own name in Preferences is not boxes (#1531). macOS always
 /// ships Kohinoor Telugu, so there the test never skips.
@@ -258,6 +290,13 @@ fn chinese_ui_uses_an_installed_chinese_face() {
             assert!(own < system, "{family:?}: {stack:?}");
             if let Some(first_ja) = stack.iter().position(|n| n.starts_with("BIZ UDPGothic")) {
                 assert!(system < first_ja, "{family:?}: {stack:?}");
+            }
+            // The per-script installed faces come after it too: Malgun Gothic (Hangul) also maps
+            // thousands of Han characters and would otherwise draw most of a Chinese line.
+            for script in [theme::SYSTEM_DEVANAGARI_FALLBACK, theme::SYSTEM_HANGUL_FALLBACK] {
+                if let Some(at) = stack.iter().position(|n| n == script) {
+                    assert!(system < at, "{family:?}: {stack:?}");
+                }
             }
         }
         let han = catalog_han(catalog);

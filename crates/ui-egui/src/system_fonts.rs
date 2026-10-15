@@ -1,12 +1,12 @@
-//! The last-resort interface font: one face already installed on this machine.
+//! The last-resort interface fonts: faces already installed on this machine.
 //!
 //! The embedded faces (Inter, egui's defaults, craft-fonts) come first in every family; this one
 //! only draws characters none of them has, such as an Arabic file name in a build without
 //! craft-fonts, or the Simplified Chinese interface in a build without a `Hans` face (#826). A
-//! few more installed faces, [`devanagari_fallback`], [`telugu_fallback`], [`sinhala_fallback`]
-//! and [`tamil_fallback`], draw Hindi, Telugu, Sinhala and Tamil when one is installed. It is
-//! read at runtime and never embedded or shipped (AGENTS.md §1.4), and `PDFCRAFT_SYSTEM_FONTS=0`
-//! turns it off (published screenshots do).
+//! few more installed faces, [`devanagari_fallback`], [`hangul_fallback`], [`telugu_fallback`],
+//! [`sinhala_fallback`] and [`tamil_fallback`], draw Hindi, Korean (#407), Telugu (#1531), Sinhala
+//! and Tamil (#1688) when one is installed. It is read at runtime and never embedded or shipped
+//! (AGENTS.md §1.4), and `PDFCRAFT_SYSTEM_FONTS=0` turns it off (published screenshots do).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -26,6 +26,8 @@ const MAX_FACES: u32 = 16;
 const PROBE: char = '\u{0627}';
 /// Devanagari letter ka: the face must have it to cover Hindi.
 const DEVANAGARI_PROBE: char = '\u{0915}';
+/// 한 (U+D55C), a Hangul syllable: the face must have it to cover Korean.
+const HANGUL_PROBE: char = '\u{D55C}';
 /// Telugu letter ka: the face must have it to cover Telugu.
 const TELUGU_PROBE: char = '\u{0C15}';
 /// Sinhala letter ka (ක): the face must have it to cover Sinhala.
@@ -79,35 +81,43 @@ fn load(need: Need) -> Option<Arc<FontData>> {
 /// or no candidate is installed; the interface then draws what the embedded faces can.
 pub fn devanagari_fallback() -> Option<Arc<FontData>> {
     static CACHE: OnceLock<Option<Arc<FontData>>> = OnceLock::new();
-    CACHE.get_or_init(|| script_fallback(&devanagari_candidates(), DEVANAGARI_PROBE)).clone()
+    CACHE.get_or_init(|| script_fallback(&devanagari_candidates(), DEVANAGARI_PROBE, MAX_BYTES)).clone()
+}
+
+/// The installed fallback face for Hangul (Korean), read once. `None` when it is turned off or
+/// no candidate is installed; the interface then draws Hangul as replacement boxes.
+pub fn hangul_fallback() -> Option<Arc<FontData>> {
+    static CACHE: OnceLock<Option<Arc<FontData>>> = OnceLock::new();
+    // macOS ships Hangul in large collections (Apple SD Gothic Neo), like its Chinese faces.
+    CACHE.get_or_init(|| script_fallback(&hangul_candidates(), HANGUL_PROBE, MAX_HAN_BYTES)).clone()
 }
 
 /// The installed fallback face for Telugu, read once. `None` when it is turned off or no
 /// candidate is installed; the interface then draws what the embedded faces can.
 pub fn telugu_fallback() -> Option<Arc<FontData>> {
     static CACHE: OnceLock<Option<Arc<FontData>>> = OnceLock::new();
-    CACHE.get_or_init(|| script_fallback(&telugu_candidates(), TELUGU_PROBE)).clone()
+    CACHE.get_or_init(|| script_fallback(&telugu_candidates(), TELUGU_PROBE, MAX_BYTES)).clone()
 }
 
 /// The installed fallback face for Sinhala, read once. `None` when it is turned off or no
 /// candidate is installed; the interface then draws what the embedded faces can.
 pub fn sinhala_fallback() -> Option<Arc<FontData>> {
     static CACHE: OnceLock<Option<Arc<FontData>>> = OnceLock::new();
-    CACHE.get_or_init(|| script_fallback(&sinhala_candidates(), SINHALA_PROBE)).clone()
+    CACHE.get_or_init(|| script_fallback(&sinhala_candidates(), SINHALA_PROBE, MAX_BYTES)).clone()
 }
 
 /// The installed fallback face for Tamil, read once. `None` when it is turned off or no
 /// candidate is installed; the interface then draws what the embedded faces can.
 pub fn tamil_fallback() -> Option<Arc<FontData>> {
     static CACHE: OnceLock<Option<Arc<FontData>>> = OnceLock::new();
-    CACHE.get_or_init(|| script_fallback(&tamil_candidates(), TAMIL_PROBE)).clone()
+    CACHE.get_or_init(|| script_fallback(&tamil_candidates(), TAMIL_PROBE, MAX_BYTES)).clone()
 }
 
-fn script_fallback(candidates: &[PathBuf], probe: char) -> Option<Arc<FontData>> {
+fn script_fallback(candidates: &[PathBuf], probe: char, max: u64) -> Option<Arc<FontData>> {
     if std::env::var_os("PDFCRAFT_SYSTEM_FONTS").is_some_and(|v| v == "0") {
         return None;
     }
-    candidates.iter().find_map(|path| read(path, probe, MAX_BYTES))
+    candidates.iter().find_map(|path| read(path, probe, max))
 }
 
 /// Well-known locations of Devanagari (Hindi) faces, best first.
@@ -141,6 +151,32 @@ fn devanagari_candidates() -> Vec<PathBuf> {
             "google-droid-sans-fonts/DroidSansDevanagari-Regular.ttf",
             "samyak-fonts/Samyak-Devanagari.ttf",
             "gargi/Gargi.ttf",
+        ])
+    }
+}
+
+/// Well-known locations of Hangul (Korean) sans faces, best first. Noto Sans CJK and Noto Sans KR
+/// are Source Han and are left out on purpose (AGENTS.md §1.1); Baekmuk, which has only the 2,350
+/// common syllables, comes last.
+fn hangul_candidates() -> Vec<PathBuf> {
+    if cfg!(windows) {
+        // Malgun Gothic ships with every edition; Gulim and Batang are the older collections.
+        ["malgun.ttf", "gulim.ttc", "batang.ttc"].iter().map(|f| windows_fonts().join(f)).collect()
+    } else if cfg!(target_os = "macos") {
+        ["/System/Library/Fonts/AppleSDGothicNeo.ttc", "/System/Library/Fonts/Supplemental/AppleGothic.ttf", "/Library/Fonts/Arial Unicode.ttf"]
+            .iter()
+            .map(PathBuf::from)
+            .collect()
+    } else {
+        unix_fonts(&[
+            "truetype/nanum/NanumGothic.ttf",
+            "naver-nanum/NanumGothic.ttf",
+            "nanum/NanumGothic.ttf",
+            "TTF/NanumGothic.ttf",
+            "truetype/unfonts-core/UnDotum.ttf",
+            "un-core/UnDotum.ttf",
+            "truetype/baekmuk/dotum.ttf",
+            "baekmuk-ttf-dotum/dotum.ttf",
         ])
     }
 }
@@ -426,5 +462,31 @@ mod tests {
                 assert!(!["notosanscjk", "notoserifcjk", "sourcehan", "source-han"].iter().any(|b| name.contains(b)), "{name}");
             }
         }
+    }
+
+    #[test]
+    fn hangul_candidates_skip_adobe_designs() {
+        let list = hangul_candidates();
+        assert!(!list.is_empty());
+        assert!(list.iter().all(|p| p.extension().is_some_and(|e| e == "ttf" || e == "ttc")), "{list:?}");
+        for path in list {
+            let name = path.to_string_lossy().to_lowercase().replace([' ', '-', '_'], "");
+            // Noto Sans/Serif KR are Source Han renamed; Pretendard and Spoqa Han Sans derive from it.
+            let barred = ["notosanscjk", "notoserifcjk", "notosanskr", "notoserifkr", "sourcehan", "pretendard", "spoqa"];
+            assert!(!barred.iter().any(|b| name.contains(b)), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_script_fallback_honours_the_probe_the_cap_and_the_switch() {
+        // Inter is Latin, Greek and Cyrillic only.
+        let inter = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/fonts/Inter-Regular.ttf"));
+        let candidates = [PathBuf::from("definitely/not/here.ttf"), inter];
+        let on = !std::env::var_os("PDFCRAFT_SYSTEM_FONTS").is_some_and(|v| v == "0");
+        assert_eq!(script_fallback(&candidates, 'A', MAX_BYTES).is_some(), on);
+        assert!(script_fallback(&candidates, 'A', 1024).is_none());
+        assert!(script_fallback(&candidates, HANGUL_PROBE, MAX_HAN_BYTES).is_none());
+        assert!(script_fallback(&candidates, DEVANAGARI_PROBE, MAX_BYTES).is_none());
+        assert!(script_fallback(&[], 'A', MAX_BYTES).is_none());
     }
 }
