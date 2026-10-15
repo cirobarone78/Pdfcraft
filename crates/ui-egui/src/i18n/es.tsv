@@ -2568,3 +2568,11 @@ animation effects	Off	Desactivados
 	Make properties default	Usar como propiedades predeterminadas
 	Pages selected	Páginas seleccionadas
 	Page properties	Propiedades de página
+	Export to Excel…	Exportar a Excel…
+	Export to Excel	Exportar a Excel
+	Sheets	Hojas
+	One sheet for the whole document	Una hoja para todo el documento
+	A table that runs across pages stays together; the pages follow one another down the sheet.	Una tabla que sigue en varias páginas queda unida; las páginas se suceden hacia abajo en la hoja.
+	One sheet per page	Una hoja por página
+	Each page on its own sheet, named Page 1, Page 2…	Cada página en su propia hoja, llamada Page 1, Page 2…
+	Tables become cells; numbers, amounts, percentages and dates become values Excel can compute with, shown as on the page.	Las tablas se convierten en celdas; los números, importes, porcentajes y fechas pasan a ser valores con los que Excel puede calcular, mostrados como en la página.
