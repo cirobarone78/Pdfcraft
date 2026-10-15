@@ -392,3 +392,74 @@ fn full_save_preserves_unknown_trailer_data() {
     assert_eq!(trailer_note(&back), trailer_note(&doc));
     assert_eq!(back.trailer().get(b"Version"), doc.trailer().get(b"Version"));
 }
+
+/// A small file whose `%PDF-` header sits after `prefix`, with its offsets counted from the
+/// header, as readers take them in such a file.
+fn prefixed(prefix: &[u8]) -> Vec<u8> {
+    let objs = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [4 0 R] /Count 1 >>",
+        "<< /Title (Prefixed) >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] >>",
+    ];
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = out.len();
+    out.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+    for o in offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< /Size 5 /Root 1 0 R /Info 3 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+    [prefix, &out].concat()
+}
+
+/// The `startxref` value a file ends with.
+fn startxref(bytes: &[u8]) -> usize {
+    let text = String::from_utf8_lossy(bytes);
+    let at = text.rfind("startxref\n").unwrap() + 10;
+    text[at..].split_whitespace().next().unwrap().parse().unwrap()
+}
+
+/// A file with bytes before its `%PDF-` header counts its offsets from the header: that is how
+/// Acrobat, qpdf, Poppler and MuPDF read it. An incremental save used to write the new objects,
+/// the new section and `startxref` as absolute positions next to the header-relative `/Prev`, so
+/// those readers reported the cross-reference data missing and rebuilt it (#2364). The update now
+/// counts from the header too, after a classic table and after a cross-reference stream.
+#[test]
+fn incremental_save_of_a_prefixed_file_counts_offsets_from_the_header() {
+    let prefix: Vec<u8> = b"bytes before the header\n".iter().cycle().take(128).copied().collect();
+    let table = prefixed(&prefix);
+    let stream = {
+        let doc = Document::open(Arc::new(prefixed(b""))).unwrap();
+        [&prefix[..], &write_full(&doc, &SaveOptions::default()).unwrap()].concat()
+    };
+    for original in [table, stream] {
+        let original = Arc::new(original);
+        let mut doc = Document::open(original.clone()).unwrap();
+        let prev = startxref(&original);
+        let info = doc.trailer().reference(b"Info").unwrap();
+        doc.update_dict(info, |d: &mut Dict| d.set(b"Subject".to_vec(), Object::String(pdfcraft_cos::PdfString::literal(b"edited".to_vec()))))
+            .unwrap();
+        let updated = write_incremental(&doc, &SaveOptions::default()).unwrap();
+        assert!(updated.starts_with(&original), "an incremental save only appends");
+        let tail = String::from_utf8_lossy(&updated[original.len()..]);
+        assert!(tail.contains(&format!("/Prev {prev}")), "{tail}");
+        // The new section is where `startxref` says, counted from the header like `/Prev`.
+        let at = startxref(&updated) + prefix.len();
+        let section = &updated[at..];
+        let head = String::from_utf8_lossy(&section[..section.len().min(16)]);
+        assert!(head.starts_with("xref") || head.contains(" 0 obj"), "{at}: {tail}");
+        // And so is the rewritten Info dictionary.
+        let back = Document::open(Arc::new(updated.clone())).unwrap();
+        assert_eq!(back.revisions().len(), 2, "{:?}", back.repair_log());
+        let Some(pdfcraft_cos::XrefEntry::InFile { offset, .. }) = back.xref_entry(info.num) else { panic!("{:?}", back.xref_entry(info.num)) };
+        let obj = &updated[offset as usize + prefix.len()..];
+        assert!(obj.starts_with(format!("{} 0 obj", info.num).as_bytes()), "{offset}: {tail}");
+        let subject = back.get(info).as_dict().unwrap().get(b"Subject").unwrap().as_string().unwrap().bytes.clone();
+        assert_eq!(subject, b"edited");
+    }
+}

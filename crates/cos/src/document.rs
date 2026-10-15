@@ -817,6 +817,15 @@ impl Document {
         &self.revisions
     }
 
+    /// What an incremental update subtracts from a file position to write an offset the way
+    /// readers take one: from the `%PDF-` header. Zero for most files. In a file with bytes
+    /// before its header, Acrobat, qpdf, Poppler and MuPDF count offsets from the header, so an
+    /// update that wrote absolute positions sent them to the wrong place, and they rebuilt the
+    /// table and reported it. Our own reader tries both.
+    pub fn offset_base(&self) -> usize {
+        if self.revisions.is_empty() { 0 } else { self.header_offset }
+    }
+
     /// Where each revision of the file ends (oldest first): the byte after the `%%EOF` (and its
     /// end-of-line) that closes its cross-reference section. `data[..end]` is that revision as it
     /// was saved. A linearized file's first-page section belongs to the revision it precedes, so

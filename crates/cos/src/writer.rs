@@ -193,7 +193,9 @@ pub fn write_incremental(doc: &Document, opts: &SaveOptions) -> Result<Vec<u8>, 
     // allocated once at its exact size: growing a buffer that holds a large original past a
     // guessed capacity would copy the whole file again and keep up to as much again unused.
     let newline = !matches!(original.last(), Some(b'\n' | b'\r'));
-    let base = (original.len() + usize::from(newline)) as u64;
+    // Offsets count from the `%PDF-` header, as readers take them in a file with bytes before
+    // it, so the new section agrees with the `/Prev` it links to (`Document::offset_base`).
+    let base = (original.len() + usize::from(newline)).saturating_sub(doc.offset_base()) as u64;
     let mut out = Vec::new();
     let mut offsets: BTreeMap<u32, (u64, u16, bool)> = BTreeMap::new(); // num → (offset, gen, in use)
     for (num, generation, obj) in doc.overlay_entries() {
@@ -478,8 +480,8 @@ fn write_xref_table(out: &mut Vec<u8>, offsets: &BTreeMap<u32, (u64, u16, bool)>
 }
 
 /// A cross-reference stream section (§7.5.8) that takes object number `num`, ending the file.
-/// `out` holds the file from byte offset `base` on. Rows are Flate-compressed with the PNG Up
-/// predictor, and field widths fit the largest value.
+/// `out` holds the file from offset `base` on (in the file's offset convention). Rows are
+/// Flate-compressed with the PNG Up predictor, and field widths fit the largest value.
 fn write_xref_stream(out: &mut Vec<u8>, base: u64, trailer: &mut Dict, mut rows: BTreeMap<u32, Row>, num: u32) {
     let xref_at = base + out.len() as u64;
     rows.insert(num, Row::InFile(xref_at, 0));
