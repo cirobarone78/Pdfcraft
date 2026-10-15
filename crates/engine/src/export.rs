@@ -142,6 +142,15 @@ pub fn encode_image(width: u32, height: u32, premultiplied: &[u8], format: Image
 /// (4.46 → 4.47 MB), a text page at 220 dpi 70 → 40 ms (0.85 → 0.89 MB), and an annual
 /// report page at 150 dpi 179 → 64 ms (1.41 → 1.38 MB).
 pub fn encode_png(width: u32, height: u32, premultiplied: &[u8]) -> Result<Vec<u8>, String> {
+    // Checked here, not left to the encoder: `as_chunks` below drops a partial trailing pixel,
+    // and the opaque path would write the rest as a valid image.
+    let expected = usize::try_from(width).ok().zip(usize::try_from(height).ok()).and_then(|(w, h)| w.checked_mul(h)?.checked_mul(4));
+    if expected != Some(premultiplied.len()) {
+        return Err(match expected {
+            Some(n) => format!("a {width}×{height} raster is {n} bytes of RGBA, got {}", premultiplied.len()),
+            None => format!("a {width}×{height} raster is too large"),
+        });
+    }
     let pixels = premultiplied.as_chunks::<4>().0;
     let opaque = pixels.iter().all(|px| px[3] == 255);
     let (color, data) = if opaque {
@@ -288,5 +297,23 @@ mod png_tests {
         let (color, pixels) = decode(&encode_png(3, 1, rgba.as_flattened()).unwrap());
         assert_eq!(color, png::ColorType::Rgba);
         assert_eq!(pixels, [128, 0, 64, 128, 0, 0, 0, 0, 10, 20, 30, 255]);
+    }
+
+    /// A buffer that is not exactly `width × height` RGBA pixels is an error, opaque or not. The
+    /// opaque path used to drop a partial trailing pixel and write the rest as a valid image.
+    #[test]
+    fn rasters_of_the_wrong_length_are_rejected() {
+        let cases: [(&str, u32, u32, &[u8]); 7] = [
+            ("opaque, a partial pixel after", 1, 1, &[10, 20, 30, 255, 0]),
+            ("opaque, three bytes after", 1, 1, &[10, 20, 30, 255, 0, 0, 0]),
+            ("translucent, a partial pixel after", 1, 1, &[10, 20, 30, 128, 0]),
+            ("opaque, a pixel short", 2, 1, &[10, 20, 30, 255]),
+            ("translucent, a pixel too many", 1, 1, &[10, 20, 30, 128, 1, 2, 3, 4]),
+            ("empty", 1, 1, &[]),
+            ("a size whose byte count overflows", u32::MAX, u32::MAX, &[10, 20, 30, 255]),
+        ];
+        for (what, width, height, data) in cases {
+            assert!(encode_png(width, height, data).is_err(), "{what}");
+        }
     }
 }
