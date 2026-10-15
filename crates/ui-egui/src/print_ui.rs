@@ -76,6 +76,10 @@ pub struct PrintDraft {
     pub as_image: bool,
     pub dpi: f64,
     pub paper: usize,
+    /// The user chose the paper in this dialog, so it no longer follows the printer's default.
+    pub paper_picked: bool,
+    /// The printer whose default paper was last looked up (once per printer, not every frame).
+    pub paper_read_for: Option<String>,
     /// The sheet shown in the preview (0-based).
     pub sheet: usize,
     pub current_page: usize,
@@ -128,6 +132,8 @@ impl Default for PrintDraft {
             content: Content::DocumentAndMarkups,
             as_image: false,
             dpi: 300.0,
+            paper_picked: false,
+            paper_read_for: None,
             paper: 0,
             sheet: 0,
             current_page: 0,
@@ -318,6 +324,9 @@ impl PdfCraftApp {
             printers,
             printers_loading,
             printer_picked: false,
+            // Each print starts on the printer's own default paper, as system print dialogs do.
+            paper_picked: false,
+            paper_read_for: None,
             units: self.units,
             printer: default,
             current_page: current,
@@ -740,11 +749,12 @@ fn driver_options_panel(ui: &mut egui::Ui, d: &mut PrintDraft, t: &Tokens) {
                 if ui.button(tl!("Done")).clicked() {
                     *show = false;
                 }
-                if ui.add_enabled(!choices.is_empty(), egui::Button::new(tl!("Reset to printer defaults"))).clicked() {
-                    choices.clear();
-                }
             });
         });
+        // A row of its own: in longer translations it would run over the title beside it.
+        if ui.add_enabled(!choices.is_empty(), egui::Button::new(tl!("Reset to printer defaults"))).clicked() {
+            choices.clear();
+        }
         if options.is_empty() {
             ui.label(egui::RichText::new(tl!("This printer offers no settings of its own.")).small().color(t.text_muted));
             return;
@@ -904,6 +914,14 @@ pub(crate) fn body(
                 });
                 ui.end_row();
                 ui.label(tl!("Paper:"));
+                // The printer's default paper (A5 on a queue set up for A5), until one is chosen here.
+                if !d.paper_picked && d.paper_read_for != d.printer {
+                    d.paper_read_for = d.printer.clone();
+                    let listed = d.printer.as_ref().is_some_and(|p| d.printers.iter().any(|q| q.name == *p));
+                    if let Some(paper) = d.printer.as_deref().filter(|_| listed && !browser).and_then(spool::default_paper) {
+                        d.paper = paper;
+                    }
+                }
                 let paper_name = PAPERS.get(d.paper).map_or("US Letter", |p| p.0);
                 let before = d.paper;
                 egui::ComboBox::from_id_salt("paper").selected_text(tl!(paper_name)).width(260.0).show_ui(ui, |ui| {
@@ -911,6 +929,9 @@ pub(crate) fn body(
                         ui.selectable_value(&mut d.paper, i, tl!(name));
                     }
                 });
+                if d.paper != before {
+                    d.paper_picked = true;
+                }
                 // Label stock gets the label layout (cut, turned upright, fitted).
                 if d.paper != before && d.paper == print::LABEL_PAPER {
                     d.handling = Handling::Label;
@@ -942,6 +963,7 @@ pub(crate) fn body(
                         && let Some(paper) = matched
                     {
                         d.paper = paper;
+                        d.paper_picked = true;
                         d.handling = Handling::Size;
                         d.size = SizeMode::Actual;
                         d.orientation = Orientation::Auto;
