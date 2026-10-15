@@ -110,11 +110,51 @@ pub fn embedded_sfnt(doc: &Document, font: &Dict) -> Option<Vec<u8>> {
         // Some PDF generators keep a Mac format-6 code→glyph cmap. egui accepts Unicode
         // format-4/12 cmaps. Combine the PDF's Unicode meanings with the source glyph IDs;
         // only this in-memory copy gets a new cmap, never the working PDF or a font asset.
-        let Ok(cmap) = face.cmap() else { continue };
         let metrics = Metrics::from_dict(doc, font);
         if metrics.composite {
+            // An embedded CIDFontType2 subset often omits cmap altogether: the PDF
+            // supplies Unicode through /ToUnicode and glyph IDs through /CIDToGIDMap.
+            // Rebuild only a temporary editor copy. Never modify the original stream.
+            let map_stream = descendant.as_ref().and_then(|d| d.get(b"CIDToGIDMap")).map(|v| doc.resolve(v));
+            let gid_bytes = match map_stream.as_deref() {
+                Some(Object::Stream(st)) => st.decoded_within(1 << 17).ok(),
+                None | Some(Object::Name(_)) => None, // /Identity is CID == GID.
+                _ => continue,
+            };
+            if matches!(map_stream.as_deref(), Some(Object::Stream(_))) && gid_bytes.is_none() {
+                continue;
+            }
+            let mut mappings = std::collections::BTreeMap::new();
+            let glyph_count = u32::from(face.metrics(skrifa::instance::Size::unscaled(), skrifa::instance::LocationRef::default()).glyph_count);
+            for code in 0..=0xFFFF_u32 {
+                let Some(value) = metrics.text_of(code) else { continue };
+                let Some(ch) = only_char(&value) else { continue };
+                let cid = metrics.cid(code);
+                let gid = if let Some(ref map) = gid_bytes {
+                    let Some(at) = (cid as usize).checked_mul(2) else { continue };
+                    let Some(pair) = map.get(at..at + 2) else { continue };
+                    u32::from(u16::from_be_bytes([pair[0], pair[1]]))
+                } else {
+                    cid
+                };
+                if gid == 0 || gid >= glyph_count { continue }
+                // An empty outline is valid for spaces, but never guess a missing letter.
+                if !ch.is_whitespace()
+                    && face.loca(None).ok().is_some_and(|loca| {
+                        loca.get_raw(gid as usize).zip(loca.get_raw(gid as usize + 1)).is_some_and(|(a, b)| b <= a)
+                    })
+                { continue; }
+                mappings.entry(u32::from(ch)).or_insert(gid);
+            }
+            if !mappings.is_empty()
+                && append_editor_cmap(&mut bytes, &mappings).is_some()
+                && skrifa::FontRef::new(&bytes).is_ok_and(|f| f.charmap().mappings().next().is_some())
+            {
+                return Some(bytes);
+            }
             continue;
         }
+        let Ok(cmap) = face.cmap() else { continue };
         let mut mappings = std::collections::BTreeMap::new();
         for code in 0..=255 {
             let Some(text) = metrics.unicode.text(code) else { continue };
@@ -188,6 +228,50 @@ fn append_editor_cmap(bytes: &mut Vec<u8>, mappings: &std::collections::BTreeMap
         if record.get(..4)? == b"head" {
             head = Some(u32::from_be_bytes(record.get(8..12)?.try_into().ok()?) as usize);
         }
+    }
+    // Some subsetters remove the entire cmap table. Extend the sfnt directory
+    // with a record, adjusting all table offsets. No original PDF bytes are touched.
+    if entry.is_none() {
+        let end = 12usize.checked_add(count.checked_mul(16)?)?;
+        if bytes.get(0..end).is_none() || count >= 256 { return None; }
+        // Check the directory before changing it.
+        for i in 0..count {
+            let at = 12 + i * 16;
+            let offset = u32::from_be_bytes(bytes.get(at + 8..at + 12)?.try_into().ok()?) as usize;
+            let len = u32::from_be_bytes(bytes.get(at + 12..at + 16)?.try_into().ok()?) as usize;
+            if offset.checked_add(len)? > bytes.len() { return None; }
+        }
+        bytes.splice(end..end, [0_u8; 16]);
+        let new_count = u16::try_from(count + 1).ok()?;
+        bytes.get_mut(4..6)?.copy_from_slice(&new_count.to_be_bytes());
+        let pow = 1_u16.checked_shl(15 - new_count.leading_zeros())?;
+        let range = pow.checked_mul(16)?;
+        bytes.get_mut(6..8)?.copy_from_slice(&range.to_be_bytes());
+        bytes.get_mut(8..10)?.copy_from_slice(&(pow.trailing_zeros() as u16).to_be_bytes());
+        bytes.get_mut(10..12)?.copy_from_slice(&(new_count * 16 - range).to_be_bytes());
+        for i in 0..count {
+            let at = 12 + i * 16;
+            let offset = u32::from_be_bytes(bytes.get(at + 8..at + 12)?.try_into().ok()?);
+            if offset as usize >= end {
+                bytes.get_mut(at + 8..at + 12)?.copy_from_slice(&offset.checked_add(16)?.to_be_bytes());
+            }
+        }
+        bytes.get_mut(end..end + 4)?.copy_from_slice(b"cmap");
+        // sfnt table directories are tag-sorted; keep cmap discoverable by
+        // parsers that binary-search the directory rather than scanning it.
+        let mut records = Vec::with_capacity(count + 1);
+        for i in 0..=count {
+            let at = 12 + i * 16;
+            let record: [u8; 16] = bytes.get(at..at + 16)?.try_into().ok()?;
+            records.push(record);
+        }
+        records.sort_unstable_by(|a, b| a[..4].cmp(&b[..4]));
+        entry = records.iter().position(|r| &r[..4] == b"cmap").map(|i| 12 + i * 16);
+        for (i, record) in records.iter().enumerate() {
+            let at = 12 + i * 16;
+            bytes.get_mut(at..at + 16)?.copy_from_slice(record);
+        }
+        head = head.map(|o| if o >= end { o + 16 } else { o });
     }
     let entry = entry?;
     let mut cmap = Vec::with_capacity(28 + mappings.len() * 12);
@@ -1252,6 +1336,25 @@ mod tests {
         assert_eq!(source.decoded().unwrap(), subset, "only an in-memory editor copy is adapted");
         let mut broken = vec![0; 16];
         assert!(append_editor_cmap(&mut broken, &std::collections::BTreeMap::from([(65, 1)])).is_none());
+    }
+
+    #[test]
+    fn missing_cmap_directory_is_reconstructed_in_memory() {
+        use skrifa::{MetadataProvider as _, raw::TableProvider as _};
+        let mut subset = include_bytes!("../../../assets/fonts/Inter-Regular.ttf").to_vec();
+        let count = u16::from_be_bytes(subset[4..6].try_into().unwrap()) as usize;
+        let entry = (0..count).map(|i| 12 + i * 16)
+            .find(|i| &subset[*i..*i + 4] == b"cmap").unwrap();
+        subset[entry..entry + 4].copy_from_slice(b"XXX0");
+        let source = subset.clone();
+        let gid = skrifa::FontRef::new(&subset).unwrap().cmap().err();
+        assert!(gid.is_some(), "the deliberately removed cmap cannot parse");
+        let original = skrifa::FontRef::new(include_bytes!("../../../assets/fonts/Inter-Regular.ttf")).unwrap();
+        let glyph = original.charmap().map('A').unwrap().to_u32();
+        append_editor_cmap(&mut subset, &std::collections::BTreeMap::from([(u32::from('א'), glyph)])).unwrap();
+        let repaired = skrifa::FontRef::new(&subset).unwrap();
+        assert_eq!(repaired.charmap().map('א').unwrap().to_u32(), glyph);
+        assert_eq!(&source[entry..entry + 4], b"XXX0");
     }
 
     fn metrics_with_flags(flags: Option<Object>) -> Metrics {

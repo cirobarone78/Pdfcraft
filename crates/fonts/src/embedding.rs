@@ -23,14 +23,28 @@ pub fn matching_faces(name: &str) -> Vec<&'static crate::CraftFont> {
 
 /// Whether a complete font program can show every non-newline character.
 pub fn covers(bytes: &[u8], text: &str) -> bool {
-    FontRef::new(bytes).is_ok_and(|f| text.chars().all(|c| matches!(c, '\n' | '\r') || f.charmap().map(c).is_some_and(|g| g.to_u32() != 0)))
+    covers_at(bytes, 0, text)
 }
 
-/// Names come from the program, never a caller's guessed family.
-pub fn names(bytes: &[u8]) -> Result<(String, String), String> {
+/// Glyph coverage of a specific face in a font collection. Intended for
+/// read-only editor matching; PDF export still validates embedding separately.
+pub fn covers_at(bytes: &[u8], index: u32, text: &str) -> bool {
+    FontRef::from_index(bytes, index).is_ok_and(|f| {
+        text.chars().all(|c| matches!(c, '\n' | '\r') || f.charmap().map(c).is_some_and(|g| g.to_u32() != 0))
+    })
+}
+
+/// Read display names without treating an already installed interface font as
+/// an exportable PDF font. Embedding permission validation remains in `names`.
+pub fn display_names(bytes: &[u8]) -> Result<(String, String), String> {
+    display_names_at(bytes, 0)
+}
+
+/// Read the family and PostScript name of one face in a macOS .ttc collection.
+/// This is only metadata discovery: it does not grant PDF embedding permission.
+pub fn display_names_at(bytes: &[u8], index: u32) -> Result<(String, String), String> {
     use skrifa::string::StringId;
-    validate(bytes)?;
-    let f = FontRef::new(bytes).map_err(|e| e.to_string())?;
+    let f = FontRef::from_index(bytes, index).map_err(|e| e.to_string())?;
     let name = |id| {
         f.localized_strings(id)
             .find(|s| s.language() == Some("en"))
@@ -41,6 +55,13 @@ pub fn names(bytes: &[u8]) -> Result<(String, String), String> {
     let family = name(StringId::FAMILY_NAME).ok_or("the font has no family name")?;
     let postscript = name(StringId::POSTSCRIPT_NAME).unwrap_or_else(|| family.replace(' ', ""));
     Ok((family, postscript))
+}
+
+/// Names for a font that may be embedded into a document. Do not use this
+/// validation for read-only interface font discovery.
+pub fn names(bytes: &[u8]) -> Result<(String, String), String> {
+    validate(bytes)?;
+    display_names(bytes)
 }
 
 /// A selected external font is document input. Require its own open-licence declaration;
@@ -302,6 +323,15 @@ fn same_resource(doc: &Document, fonts: &Dict, name: &str, bytes: &[u8], glyph_m
 mod tests {
     use super::*;
     use crate::pdf::Metrics;
+
+    #[test]
+    fn read_only_installed_font_name_and_coverage_do_not_require_export() {
+        let font = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
+        assert_eq!(display_names_at(font, 0).unwrap(), display_names(font).unwrap());
+        assert!(display_names_at(font, 1).is_err());
+        assert!(covers_at(font, 0, "Hello!"));
+        assert!(!covers_at(font, 0, "שלום"));
+    }
 
     #[test]
     fn full_unicode_embedding_keeps_outlines_advances_and_roundtrip_codes() {

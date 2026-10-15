@@ -68,6 +68,11 @@ impl TextBackground {
                 self.draft_key = Some(draft_key);
             }
         }
+        // The original page already has the exact text. Avoid an unused textless
+        // raster job on focus; start it only if the user actually edits the block.
+        if editor.is_some_and(LineEditor::pristine_source_visible) {
+            return;
+        }
         let (Some((_, page, _)), Some(renderer)) = (self.key, self.renderer.as_ref()) else { return };
         let Some(p) = doc.info.pages.get(page) else { return };
         // One raster stands in for the page's tiles while a paragraph is open, so everything
@@ -117,6 +122,12 @@ impl TextBackground {
         editor: Option<&LineEditor>,
         draft: Option<&crate::content_ui::TextDraft>,
     ) {
+        // Entering Edit Text must never redraw untouched text through a different font
+        // or bidi renderer. The original page raster remains authoritative until
+        // a real edit changes the glyphs or their style.
+        if editor.is_some_and(|ed| ed.page == page && ed.pristine_source_visible()) {
+            return;
+        }
         let ready = editor.is_some_and(|ed| ed.page == page && self.ready(page, ed.block))
             || draft.is_some_and(|d| d.page == page && d.index.is_some_and(|index| self.ready_added(page, index)));
         if !ready {
@@ -212,6 +223,15 @@ pub(crate) fn extras_panel(ui: &mut egui::Ui, e: &mut Extras) -> bool {
 impl LineEditor {
     pub(crate) fn has_changes(&self) -> bool {
         self.text != self.original || self.look != self.look0 || self.extras != self.extras0
+    }
+
+    /// Keep the original PDF glyphs on screen while the editor is pristine.
+    /// This avoids word-order changes, mark detachment, and font substitutions
+    /// merely from opening the editor. OCR layers are not visible PDF text.
+    pub(crate) fn pristine_source_visible(&self) -> bool {
+        !self.has_changes()
+            && self.font_resource.is_none()
+            && self.source.as_ref().is_some_and(|(block, _)| !block.invisible)
     }
 
     /// Extra width permitted by the editor. Source containers now remain fixed.
@@ -1127,6 +1147,75 @@ pub(crate) fn install_source_fonts(ctx: &egui::Context, doc: &pdfcraft_engine::D
         definitions.font_data.insert(name.clone(), Arc::new(egui::FontData::from_owned(program.bytes.clone())));
         families.insert(program.resource.clone(), name);
     }
+    // Interface-only matching of a PDF's named font to a user-installed face.
+    // No system font bytes are written back into a PDF. Source-embedded fonts win.
+    // A face must match the PDF family/PostScript name, not merely its style.
+    #[cfg(target_os = "macos")]
+    {
+        let missing: Vec<_> = doc.text_lines(page).into_iter()
+            .filter(|line| !families.contains_key(&line.font))
+            .map(|line| (line.font, line.base_font, line.text))
+            .collect();
+        if !missing.is_empty() && std::env::var_os("PDFCRAFT_SYSTEM_FONTS").is_none_or(|v| v != "0") {
+            let mut roots = vec![
+                std::path::PathBuf::from("/Library/Fonts"),
+                std::path::PathBuf::from("/System/Library/Fonts"),
+                std::path::PathBuf::from("/System/Library/Fonts/Supplemental"),
+            ];
+            if let Some(home) = std::env::var_os("HOME") {
+                roots.push(std::path::PathBuf::from(home).join("Library/Fonts"));
+            }
+            let mut scanned = 0_usize;
+            for root in roots {
+                let Ok(entries) = std::fs::read_dir(root) else { continue };
+                for entry in entries.flatten() {
+                    // Stop parsing installed fonts once every missing document face
+                    // has been matched. Keep the same opt-out as the UI font policy.
+                    if missing.iter().all(|(resource, _, _)| families.contains_key(resource)) {
+                        break;
+                    }
+                    if scanned >= 1024 || families.len() >= 128 { break; }
+                    scanned += 1;
+                    let path = entry.path();
+                    let Some(ext) = path.extension().and_then(|e| e.to_str()) else { continue };
+                    let collection = ext.eq_ignore_ascii_case("ttc");
+                    if !collection && !ext.eq_ignore_ascii_case("ttf") && !ext.eq_ignore_ascii_case("otf") { continue; }
+                    let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+                    // Larger, multi-face collections are ordinary macOS installed fonts.
+                    let limit = if collection { 64_u64 << 20 } else { 16_u64 << 20 };
+                    if !meta.is_file() || meta.len() > limit { continue; }
+                    let Ok(bytes) = std::fs::read(&path) else { continue };
+                    for face_index in 0..if collection { 16 } else { 1 } {
+                        let Ok((family, postscript)) = pdfcraft_fonts::embedding::display_names_at(&bytes, face_index) else { break };
+                        let matched: Vec<_> = missing.iter().filter(|(resource, source, sample)| {
+                            let nonspace: String = sample.chars().filter(|ch| !ch.is_whitespace()).collect();
+                            !families.contains_key(resource)
+                                && [family.as_str(), postscript.as_str()].iter().any(|name| {
+                                    pdfcraft_fonts::embedding::face_key(name) ==
+                                        pdfcraft_fonts::embedding::face_key(source)
+                                })
+                                && pdfcraft_fonts::embedding::covers_at(&bytes, face_index, &nonspace)
+                        }).collect();
+                        if matched.is_empty() { continue; }
+                        let name = format!("pdf-source-installed-{}", definitions.font_data.len());
+                        let mut data = egui::FontData::from_owned(bytes.clone());
+                        data.index = face_index;
+                        definitions.font_data.insert(name.clone(), Arc::new(data));
+                        // A system font is an interface-only fallback: it must not be
+                        // selected for implicit embedding in the saved PDF.
+                        let mut stack = vec![name.clone()];
+                        if let Some(defaults) = definitions.families.get(&FontFamily::Proportional) {
+                            stack.extend(defaults.iter().cloned());
+                        }
+                        definitions.families.insert(FontFamily::Name(name.clone().into()), stack);
+                        for (resource, _, _) in matched {
+                            families.insert(resource.clone(), name.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
     for program in &programs {
         let Some(name) = families.get(&program.resource) else { continue };
         // Word-created PDFs often split one face into several subsets. Use all of the
@@ -1207,7 +1296,7 @@ fn editor_job(ui: &egui::Ui, ed: &LineEditor, text: &str, scale: f32, width: f32
                 egui::TextFormat {
                     font_id: font,
                     extra_letter_spacing: spacing + ed.extras.char_spacing as f32 * scale,
-                    color: color32(look.color),
+                    color: if ed.pristine_source_visible() { Color32::TRANSPARENT } else { color32(look.color) },
                     italics: look.italic && !embedded,
                     ..Default::default()
                 },
@@ -1233,6 +1322,12 @@ fn editor_job(ui: &egui::Ui, ed: &LineEditor, text: &str, scale: f32, width: f32
 fn editor_galley(ui: &egui::Ui, ed: &LineEditor, text: &str, scale: f32, width: f32) -> Arc<egui::Galley> {
     let mut job = editor_job(ui, ed, text, scale, width);
     let centered = job.halign == egui::Align::Center;
+    // PDF source rows have physical left and right edges. For an RTL paragraph,
+    // retain the source right edge rather than treating its varying left edge
+    // as the paragraph anchor.
+    let rtl = text.chars().find(|c| c.is_alphabetic()).is_some_and(|c| {
+        matches!(u32::from(c), 0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFC)
+    });
     job.halign = egui::Align::LEFT;
     let mut galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
     let Some((block, lines)) = &ed.source else { return galley };
@@ -1276,7 +1371,13 @@ fn editor_galley(ui: &egui::Ui, ed: &LineEditor, text: &str, scale: f32, width: 
         let base_y = (block.rect[3] - baseline) as f32 * scale;
         let row = Arc::make_mut(&mut placed.row);
         placed.pos.y = base_y - ascent;
-        placed.pos.x = if centered { (width - row.size.x) / 2.0 } else { (source_rect[0] - block.rect[0]) as f32 * scale };
+        placed.pos.x = if centered {
+            (width - row.size.x) / 2.0
+        } else if rtl {
+            (source_rect[2] - block.rect[0]) as f32 * scale - row.size.x
+        } else {
+            (source_rect[0] - block.rect[0]) as f32 * scale
+        };
         for glyph in &mut row.glyphs {
             let dy = ascent - glyph.pos.y;
             glyph.pos.y = ascent;
@@ -1331,6 +1432,7 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo) -
     ed.size = (ed.look.size as f32 * scale).clamp(1.0, 300.0);
     let font = editor_font(&ed.look, ed.size);
     let text_color = color32(ed.look.color);
+    let pristine_source = ed.pristine_source_visible();
     let mut done = None;
     egui::Area::new(egui::Id::new("edit-text-line")).order(egui::Order::Foreground).fixed_pos(Pos2::new(ed.rect.left(), ed.rect.top())).show(
         ctx,
@@ -1365,17 +1467,17 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo) -
             }
             // White, unless the text is too pale to read on white (white text from a coloured
             // banner, #913): then a dark box, with a caret that shows on it.
-            let fill = if background_ready { Color32::TRANSPARENT } else { editor_fill(text_color) };
+            let fill = if background_ready || pristine_source { Color32::TRANSPARENT } else { editor_fill(text_color) };
             // Until the background worker finishes, cover the entire source box, including
             // lines the draft no longer occupies. Shrinking the text must never expose a copy.
-            if !background_ready {
+            if !background_ready && !pristine_source {
                 ui.painter().rect_filled(ed.rect.expand(1.0), CornerRadius::ZERO, fill);
             }
             egui::Frame::NONE.fill(fill).show(ui, |ui| {
                 // A textless PDF preview keeps its real page background through the transparent editor.
                 // The temporary opaque cover uses the shared caret-contrast rule.
                 ui.visuals_mut().text_cursor.stroke.color =
-                    if background_ready { if luminance(text_color) < 0.5 { Color32::BLACK } else { Color32::WHITE } } else { caret_color_on(fill) };
+                    if background_ready || pristine_source { if luminance(text_color) < 0.5 { Color32::BLACK } else { Color32::WHITE } } else { caret_color_on(fill) };
                 let rows = 1;
                 let snapshot = ed.clone();
                 let mut layouter =
@@ -1473,6 +1575,42 @@ mod tests {
             extras0: Extras::default(),
         };
         (app, ed)
+    }
+
+    #[test]
+    fn pristine_pdf_text_stays_in_the_source_renderer_until_the_first_edit() {
+        let (app, mut ed) = preview_app();
+        let doc = app.session.get(app.views[0].id).unwrap();
+        ed.source = Some((doc.text_blocks(0).remove(0), doc.text_lines(0)));
+        assert!(ed.pristine_source_visible(), "opening a text block must keep original glyphs visible");
+
+        ed.text.push('x');
+        assert!(!ed.pristine_source_visible(), "typing must activate editable text rendering");
+
+        ed.text = ed.original.clone();
+        ed.font_resource = Some("F1".to_owned());
+        assert!(!ed.pristine_source_visible(), "a different selected font must activate preview");
+
+        ed.font_resource = None;
+        assert!(ed.pristine_source_visible(), "undo restores the original PDF glyph presentation");
+    }
+
+    #[test]
+    fn opening_a_source_paragraph_never_paints_its_reconstructed_glyphs() {
+        let (app, mut ed) = preview_app();
+        let doc = app.session.get(app.views[0].id).unwrap();
+        ed.source = Some((doc.text_blocks(0).remove(0), doc.text_lines(0)));
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::theme::font_definitions());
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let original = editor_job(ui, &ed, &ed.text, 1.0, 400.0);
+            assert!(!original.sections.is_empty());
+            assert!(original.sections.iter().all(|s| s.format.color == Color32::TRANSPARENT));
+            ed.text.push('x');
+            let edited = editor_job(ui, &ed, &ed.text, 1.0, 400.0);
+            assert!(edited.sections.iter().any(|s| s.format.color != Color32::TRANSPARENT));
+        });
+        output.drop_without_applying_deltas();
     }
 
     #[test]

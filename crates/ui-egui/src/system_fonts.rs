@@ -26,6 +26,8 @@ const MAX_FACES: u32 = 16;
 const PROBE: char = '\u{0627}';
 /// Devanagari letter ka: the face must have it to cover Hindi.
 const DEVANAGARI_PROBE: char = '\u{0915}';
+/// Hebrew alef: do not choose an Arabic-only system face for Hebrew file names or editor text.
+const HEBREW_PROBE: char = '\u{05D0}';
 /// Telugu letter ka: the face must have it to cover Telugu.
 const TELUGU_PROBE: char = '\u{0C15}';
 /// Sinhala letter ka (ක): the face must have it to cover Sinhala.
@@ -82,6 +84,13 @@ pub fn devanagari_fallback() -> Option<Arc<FontData>> {
     CACHE.get_or_init(|| script_fallback(&devanagari_candidates(), DEVANAGARI_PROBE)).clone()
 }
 
+/// A Hebrew-capable system font for file names and editing when build fonts are absent.
+/// It is interface-only; PDF output must embed a permitted document font separately.
+pub fn hebrew_fallback() -> Option<Arc<FontData>> {
+    static CACHE: OnceLock<Option<Arc<FontData>>> = OnceLock::new();
+    CACHE.get_or_init(|| script_fallback(&hebrew_candidates(), HEBREW_PROBE)).clone()
+}
+
 /// The installed fallback face for Telugu, read once. `None` when it is turned off or no
 /// candidate is installed; the interface then draws what the embedded faces can.
 pub fn telugu_fallback() -> Option<Arc<FontData>> {
@@ -108,6 +117,30 @@ fn script_fallback(candidates: &[PathBuf], probe: char) -> Option<Arc<FontData>>
         return None;
     }
     candidates.iter().find_map(|path| read(path, probe, MAX_BYTES))
+}
+
+/// Installed Hebrew-capable faces. These are used only for on-screen interface rendering.
+fn hebrew_candidates() -> Vec<PathBuf> {
+    if cfg!(windows) {
+        ["arial.ttf", "david.ttf", "miriam.ttf", "tahoma.ttf"].iter().map(|f| windows_fonts().join(f)).collect()
+    } else if cfg!(target_os = "macos") {
+        [
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Hebrew.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Hebrew Bold.ttf",
+            "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+            "/Library/Fonts/Arial.ttf",
+        ]
+        .iter().map(PathBuf::from).collect()
+    } else {
+        unix_fonts(&[
+            "truetype/noto/NotoSansHebrew-Regular.ttf",
+            "noto/NotoSansHebrew-Regular.ttf",
+            "google-noto/NotoSansHebrew-Regular.ttf",
+            "truetype/dejavu/DejaVuSans.ttf",
+            "dejavu/DejaVuSans.ttf",
+        ])
+    }
 }
 
 /// Well-known locations of Devanagari (Hindi) faces, best first.
@@ -377,6 +410,7 @@ mod tests {
         // Inter is Latin, Greek and Cyrillic only.
         let inter = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
         assert_eq!(face_with(inter, PROBE), None);
+        assert_eq!(face_with(inter, HEBREW_PROBE), None);
         assert_eq!(face_with(inter, HANS_PROBE), None);
         assert_eq!(face_with(inter, HANT_PROBE), None);
         assert_eq!(face_with(inter, 'A'), Some(0));
@@ -404,6 +438,7 @@ mod tests {
         let candidates = [PathBuf::from("definitely/not/here.ttf"), inter];
         assert!(script_fallback(&candidates, 'A').is_some());
         assert!(script_fallback(&candidates, TELUGU_PROBE).is_none());
+        assert!(script_fallback(&candidates, HEBREW_PROBE).is_none());
         assert!(script_fallback(&candidates, DEVANAGARI_PROBE).is_none());
         assert!(script_fallback(&candidates, SINHALA_PROBE).is_none());
         assert!(script_fallback(&candidates, TAMIL_PROBE).is_none());
@@ -411,7 +446,7 @@ mod tests {
 
     #[test]
     fn script_candidates_are_absolute_font_files() {
-        for list in [devanagari_candidates(), telugu_candidates(), sinhala_candidates(), tamil_candidates()] {
+        for list in [hebrew_candidates(), devanagari_candidates(), telugu_candidates(), sinhala_candidates(), tamil_candidates()] {
             assert!(!list.is_empty());
             assert!(list.iter().all(|p| p.is_absolute() || cfg!(windows)), "{list:?}");
             assert!(list.iter().all(|p| p.extension().is_some_and(|e| e == "ttf" || e == "ttc")), "{list:?}");

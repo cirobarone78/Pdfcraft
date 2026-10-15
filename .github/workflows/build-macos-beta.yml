@@ -1,0 +1,226 @@
+name: Build PDFCraftBeta for macOS
+
+on:
+  push:
+    branches: [fix/hebrew-editor-fonts-20261015]
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch to compile (Hebrew fixes by default)
+        required: true
+        default: fix/hebrew-editor-fonts-20261015
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  macos-beta:
+    name: Apple Silicon PDFCraftBeta.app
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Check out selected source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.source_ref || github.ref_name }}
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      # Cache compiled dependencies and build artifacts across beta builds.
+      # The pinned action is Node.js 24 compatible and is also used by project CI.
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2, Node.js 24
+        with:
+          shared-key: pdfcraftbeta-macos-arm64
+
+      - name: Check out the optional font collection
+        uses: actions/checkout@v5
+        with:
+          repository: storytold/craft-fonts
+          ref: 3d9ab3a132ed0eff457e424226a435a901da30d3
+          path: craft-fonts
+          persist-credentials: false
+
+      - name: Add openly licensed static Hebrew fonts to beta build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/hebrew-font-tools"
+          "$RUNNER_TEMP/hebrew-font-tools/bin/python" -m pip install --disable-pip-version-check "fonttools==4.60.1"
+          mkdir -p craft-fonts/fonts/noto-sans-hebrew
+          curl --fail --location --retry 3 \
+            'https://raw.githubusercontent.com/google/fonts/9710da1eacb3be272583c3224dcb70f9da6eadbb/ofl/notosanshebrew/NotoSansHebrew%5Bwdth%2Cwght%5D.ttf' \
+            -o "$RUNNER_TEMP/NotoSansHebrew-VF.ttf"
+          curl --fail --location --retry 3 \
+            'https://raw.githubusercontent.com/google/fonts/9710da1eacb3be272583c3224dcb70f9da6eadbb/ofl/notosanshebrew/OFL.txt' \
+            -o craft-fonts/fonts/noto-sans-hebrew/OFL.txt
+          "$RUNNER_TEMP/hebrew-font-tools/bin/python" - <<'PY'
+          from fontTools.ttLib import TTFont
+          from fontTools.varLib.instancer import instantiateVariableFont
+          from pathlib import Path
+          source = Path(__import__('os').environ['RUNNER_TEMP']) / 'NotoSansHebrew-VF.ttf'
+          for style, weight in [('Regular', 400), ('Bold', 700)]:
+              font = TTFont(source)
+              axes = {a.axisTag: a.defaultValue for a in font['fvar'].axes}
+              axes['wght'] = weight
+              static = instantiateVariableFont(font, axes, inplace=True)
+              static.save(f'craft-fonts/fonts/noto-sans-hebrew/NotoSansHebrew-{style}.ttf')
+              static.close()
+          PY
+          for style in Regular Bold; do
+            font="craft-fonts/fonts/noto-sans-hebrew/NotoSansHebrew-${style}.ttf"
+            test -s "$font"
+            hash="$(shasum -a 256 "$font" | awk '{print $1}')"
+            printf 'Noto Sans Hebrew | %s | fonts/noto-sans-hebrew/NotoSansHebrew-%s.ttf | Hebr,Latn | OFL-1.1 | fonts/noto-sans-hebrew/OFL.txt | %s | https://github.com/google/fonts/tree/9710da1eacb3be272583c3224dcb70f9da6eadbb/ofl/notosanshebrew\n' "$style" "$style" "$hash" >> craft-fonts/fonts/manifest.txt
+          done
+          grep -q 'Noto Sans Hebrew | Regular' craft-fonts/fonts/manifest.txt
+
+      - name: Compile PDFCraftBeta with embedded Hebrew faces
+        env:
+          PDFCRAFT_BETA: "1"
+          PDFCRAFT_BUILD_LABEL: "beta"
+          CRAFT_FONTS_REQUIRED: "1"
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CRAFT_FONTS_DIR="$GITHUB_WORKSPACE/craft-fonts"
+          cargo build --release --locked --target aarch64-apple-darwin -p pdfcraft
+          test -x target/aarch64-apple-darwin/release/pdfcraft
+
+      - name: Package separately installable PDFCraftBeta.app
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/PDFCraftBeta.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp target/aarch64-apple-darwin/release/pdfcraft "$app/Contents/MacOS/PDFCraftBeta"
+          cp assets/app-icon/pdfcraft.icns "$app/Contents/Resources/PDFCraftBeta.icns"
+          cp packaging/macos/Credits.rtf "$app/Contents/Resources/Credits.rtf"
+          cp craft-fonts/fonts/noto-sans-hebrew/OFL.txt "$app/Contents/Resources/OFL-Noto-Sans-Hebrew.txt"
+          version="$(awk '/^\[workspace.package\]/{inpkg=1;next} /^\[/{inpkg=0} inpkg && $1=="version" {gsub(/"/,"",$3); print $3; exit}' Cargo.toml)"
+          cat > "$app/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleIdentifier</key><string>com.pmeir99.pdfcraftbeta</string>
+            <key>CFBundleName</key><string>PDFCraftBeta</string>
+            <key>CFBundleDisplayName</key><string>PDFCraftBeta</string>
+            <key>CFBundleExecutable</key><string>PDFCraftBeta</string>
+            <key>CFBundleIconFile</key><string>PDFCraftBeta</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${version}</string>
+            <key>CFBundleVersion</key><string>${version}</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>NSRequiresAquaSystemAppearance</key><false/>
+          </dict></plist>
+          PLIST
+          plutil -lint "$app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" | grep -Fx 'com.pmeir99.pdfcraftbeta'
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          mkdir -p dist
+          ditto -c -k --keepParent "$app" dist/PDFCraftBeta-macOS-AppleSilicon.zip
+          ls -lh dist/PDFCraftBeta-macOS-AppleSilicon.zip
+
+      - name: Upload downloadable macOS app
+        uses: actions/upload-artifact@v6
+        with:
+          name: PDFCraftBeta-macOS-AppleSilicon
+          path: dist/PDFCraftBeta-macOS-AppleSilicon.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  # These tests previously spent 40+ minutes compiling optimized test harnesses
+  # on the scarce macOS runner. Run the same focused checks independently on
+  # Linux with Cargo's test profile, so macOS can package its release binary.
+  regression-tests:
+    name: Font and editor regression checks (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      PDFCRAFT_BETA: "1"
+      CRAFT_FONTS_REQUIRED: "1"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_TEST_INCREMENTAL: "false"
+    steps:
+      - name: Check out selected source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.source_ref || github.ref_name }}
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust test dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2, Node.js 24
+        with:
+          shared-key: pdfcraftbeta-linux-regressions
+
+      - name: Install Linux build libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libgtk-3-dev
+
+      - name: Check out the optional font collection
+        uses: actions/checkout@v5
+        with:
+          repository: storytold/craft-fonts
+          ref: 3d9ab3a132ed0eff457e424226a435a901da30d3
+          path: craft-fonts
+          persist-credentials: false
+
+      - name: Add openly licensed static Hebrew fonts to beta build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/hebrew-font-tools"
+          "$RUNNER_TEMP/hebrew-font-tools/bin/python" -m pip install --disable-pip-version-check "fonttools==4.60.1"
+          mkdir -p craft-fonts/fonts/noto-sans-hebrew
+          curl --fail --location --retry 3 \
+            'https://raw.githubusercontent.com/google/fonts/9710da1eacb3be272583c3224dcb70f9da6eadbb/ofl/notosanshebrew/NotoSansHebrew%5Bwdth%2Cwght%5D.ttf' \
+            -o "$RUNNER_TEMP/NotoSansHebrew-VF.ttf"
+          curl --fail --location --retry 3 \
+            'https://raw.githubusercontent.com/google/fonts/9710da1eacb3be272583c3224dcb70f9da6eadbb/ofl/notosanshebrew/OFL.txt' \
+            -o craft-fonts/fonts/noto-sans-hebrew/OFL.txt
+          "$RUNNER_TEMP/hebrew-font-tools/bin/python" - <<'PY'
+          from fontTools.ttLib import TTFont
+          from fontTools.varLib.instancer import instantiateVariableFont
+          from pathlib import Path
+          source = Path(__import__('os').environ['RUNNER_TEMP']) / 'NotoSansHebrew-VF.ttf'
+          for style, weight in [('Regular', 400), ('Bold', 700)]:
+              font = TTFont(source)
+              axes = {a.axisTag: a.defaultValue for a in font['fvar'].axes}
+              axes['wght'] = weight
+              static = instantiateVariableFont(font, axes, inplace=True)
+              static.save(f'craft-fonts/fonts/noto-sans-hebrew/NotoSansHebrew-{style}.ttf')
+              static.close()
+          PY
+          for style in Regular Bold; do
+            font="craft-fonts/fonts/noto-sans-hebrew/NotoSansHebrew-${style}.ttf"
+            test -s "$font"
+            hash="$(shasum -a 256 "$font" | awk '{print $1}')"
+            printf 'Noto Sans Hebrew | %s | fonts/noto-sans-hebrew/NotoSansHebrew-%s.ttf | Hebr,Latn | OFL-1.1 | fonts/noto-sans-hebrew/OFL.txt | %s | https://github.com/google/fonts/tree/9710da1eacb3be272583c3224dcb70f9da6eadbb/ofl/notosanshebrew\n' "$style" "$style" "$hash" >> craft-fonts/fonts/manifest.txt
+          done
+          grep -q 'Noto Sans Hebrew | Regular' craft-fonts/fonts/manifest.txt
+
+
+      - name: Run the same four focused regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CRAFT_FONTS_DIR="$GITHUB_WORKSPACE/craft-fonts"
+          # Test profile: no release LTO/whole-program optimization for test binaries.
+          cargo test --locked --lib -p pdfcraft-fonts missing_cmap_directory_is_reconstructed_in_memory
+          cargo test --locked --lib -p pdfcraft-fonts read_only_installed_font_name_and_coverage_do_not_require_export
+          cargo test --locked --lib -p pdfcraft-ui-egui pristine_pdf_text_stays_in_the_source_renderer_until_the_first_edit
+          cargo test --locked --lib -p pdfcraft-ui-egui opening_a_source_paragraph_never_paints_its_reconstructed_glyphs

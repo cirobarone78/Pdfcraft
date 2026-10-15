@@ -143,6 +143,9 @@ fn group_layout(lines: &[TextLine], mixed: bool) -> Vec<TextBlock> {
                 && !row_text.ends_with(char::is_whitespace)
                 && !line.text.starts_with(char::is_whitespace)
                 && line.frame_rect()[0] - prev.frame_rect()[2] > line.size * 0.12
+                // A separately positioned vowel mark isn't a new word even when
+                // the producer's advance/geometry looks like an inter-word gap.
+                && !line.text.chars().next().is_some_and(crate::bidi::is_hebrew_mark)
             {
                 row_text.push(' ');
                 block.editor_text.push(' ');
@@ -194,6 +197,27 @@ fn shape_source(
             && let Ok(shaped) = pdfcraft_fonts::source_shaping::shape(&bytes, text)
         {
             return Ok(Some((bytes, shaped, family)));
+        }
+    }
+    // Preserve the source's embedded glyphs first. When its subset cannot cover newly
+    // inserted Hebrew, prefer a complete matching build face before substituting families.
+    for face in pdfcraft_fonts::embedding::matching_faces(&family) {
+        if pdfcraft_fonts::embedding::covers(face.bytes, text)
+            && let Ok(shaped) = pdfcraft_fonts::source_shaping::shape(face.bytes, text)
+        {
+            return Ok(Some((face.bytes.to_vec(), shaped, face.family.to_string())));
+        }
+    }
+    // Hebrew input may come from a subset with no matching complete face. The bundled
+    // Hebrew document face supports shaped glyphs (including marks), unlike the legacy
+    // one-character Type 3 fallback. Never use an interface-only system font here.
+    if text.chars().any(|c| matches!(c as u32, 0x0590..=0x05FF | 0xFB1D..=0xFB4F)) {
+        for face in pdfcraft_fonts::ui_hebrew_fonts() {
+            if pdfcraft_fonts::embedding::covers(face.bytes, text)
+                && let Ok(shaped) = pdfcraft_fonts::source_shaping::shape(face.bytes, text)
+            {
+                return Ok(Some((face.bytes.to_vec(), shaped, face.family.to_string())));
+            }
         }
     }
     Err(EditError::Invalid("complex text needs the complete source TrueType/OpenType face; load that font before editing".into()))
@@ -412,22 +436,6 @@ pub(super) fn rewrite_styled_block(
                 pdfcraft_fonts::embedding::face_key(&m.base_font) == pdfcraft_fonts::embedding::face_key(&source.base_font) && source_encodes(m, &s)
             }) {
                 name.clone()
-            } else if let Some(face) =
-                pdfcraft_fonts::embedding::matching_faces(&source.base_font).into_iter().find(|f| pdfcraft_fonts::embedding::covers(f.bytes, &s))
-            {
-                let key = face.name();
-                if let Some(name) = full_faces.get(&key) {
-                    name.clone()
-                } else {
-                    let name = pdfcraft_fonts::embedding::embed(doc, &mut fonts, face.bytes, face.family).map_err(EditError::Invalid)?;
-                    let font = fonts
-                        .get(name.as_bytes())
-                        .and_then(|f| doc.dict(f))
-                        .ok_or_else(|| EditError::Invalid("the full source font could not be loaded".into()))?;
-                    metrics.insert(name.clone(), Metrics::from_dict(doc, &font));
-                    full_faces.insert(key, name.clone());
-                    name
-                }
             } else if let Some(bytes) = programs
                 .entry(source.font.clone())
                 .or_insert_with(|| source_program(doc, &fonts, &source.font).map(std::sync::Arc::new))
@@ -446,6 +454,22 @@ pub(super) fn rewrite_styled_block(
                         .get(name.as_bytes())
                         .and_then(|f| doc.dict(f))
                         .ok_or_else(|| EditError::Invalid("the source font could not be loaded".into()))?;
+                    metrics.insert(name.clone(), Metrics::from_dict(doc, &font));
+                    full_faces.insert(key, name.clone());
+                    name
+                }
+            } else if let Some(face) =
+                pdfcraft_fonts::embedding::matching_faces(&source.base_font).into_iter().find(|f| pdfcraft_fonts::embedding::covers(f.bytes, &s))
+            {
+                let key = face.name();
+                if let Some(name) = full_faces.get(&key) {
+                    name.clone()
+                } else {
+                    let name = pdfcraft_fonts::embedding::embed(doc, &mut fonts, face.bytes, face.family).map_err(EditError::Invalid)?;
+                    let font = fonts
+                        .get(name.as_bytes())
+                        .and_then(|f| doc.dict(f))
+                        .ok_or_else(|| EditError::Invalid("the full source font could not be loaded".into()))?;
                     metrics.insert(name.clone(), Metrics::from_dict(doc, &font));
                     full_faces.insert(key, name.clone());
                     name
