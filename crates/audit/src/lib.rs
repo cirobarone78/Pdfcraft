@@ -7,15 +7,21 @@
 //! A rectangle counts as a cover only when it was painted strictly *after* the text it
 //! overlaps, and only when it is dark enough against the text's color to make the text
 //! unreadable (WCAG contrast below 3.0). Page backgrounds, table shading and highlight
-//! marks are therefore not flagged.
+//! marks are therefore not flagged. A white (or nearly white) opaque rectangle painted after
+//! dark text hides it just as well, the way forms are "whited out"; that is reported as its
+//! own kind, [`FindingKind::HiddenUnderWhite`], so callers can decide (#2385).
 //!
-//! Detection limits (documented, not hidden): `re` rectangles and single closed `m`/`l`
-//! subpaths whose four corners form an axis-aligned rectangle in user space (#1510) are
-//! considered when closed by a fill operator — other filled paths, shadings and patterns are
-//! not; a rectangle drawn with a translucent ExtGState (`/ca < 1`) is not flagged; annotation
-//! rectangles are compared in unrotated user space, so pages with `/Rotate` may misalign;
-//! covers inside form XObjects are found, but only text drawn directly in the page content
-//! is checked under them, so text inside a form XObject is not audited.
+//! Covers come from the page content — `re` rectangles and single closed `m`/`l` subpaths whose
+//! four corners form an axis-aligned rectangle in user space (#1510), filled opaquely, and a
+//! thick opaque stroke along one axis (a "marker" line) — and from the annotations: an opaque
+//! `/Highlight` dark enough to hide the text under it (#2385).
+//!
+//! Detection limits (documented, not hidden): other filled paths, slanted or bent strokes,
+//! shadings and patterns are not considered; a cover drawn with a translucent ExtGState
+//! (`/ca`, `/CA < 1`) or a highlight with `/CA < 1` is not flagged; annotation rectangles are
+//! compared in unrotated user space, so pages with `/Rotate` may misalign; covers inside form
+//! XObjects are found, but only text drawn directly in the page content is checked under them,
+//! so text inside a form XObject is not audited.
 //!
 //! The audit fails closed: any content that cannot be read (an undecodable content stream,
 //! malformed annotations, form XObjects nested deeper than 32 or in a cycle) is an error, never
@@ -34,10 +40,14 @@ mod tests;
 /// What the audit found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FindingKind {
-    /// An opaque filled rectangle covers text that is still extractable.
+    /// An opaque dark cover (a filled rectangle, a thick stroke, a highlight annotation) hides
+    /// text that is still extractable.
     CoveredText,
     /// A `/Redact` annotation was placed but never applied: the text is untouched.
     UnappliedMark,
+    /// A white (or nearly white) opaque rectangle painted after dark text hides it: the text is
+    /// invisible on the page and still extractable (a "whited out" form).
+    HiddenUnderWhite,
 }
 
 impl FindingKind {
@@ -50,6 +60,7 @@ impl FindingKind {
         match self {
             FindingKind::CoveredText => "covered-text",
             FindingKind::UnappliedMark => "unapplied-mark",
+            FindingKind::HiddenUnderWhite => "hidden-under-white",
         }
     }
 }
@@ -89,6 +100,9 @@ pub enum AuditError {
 const COVER_FRACTION: f64 = 0.4;
 /// WCAG contrast ratio below which the text is unreadable against the cover.
 const COVER_CONTRAST: f64 = 3.0;
+/// Relative luminance from which an opaque cover counts as white (white is 1.0; `0.9 g`, the
+/// kind of shading a table has, is 0.79): dark text under it is gone, not shaded.
+const WHITE_LUMINANCE: f64 = 0.9;
 
 /// Audit every page for faux redactions and unapplied redaction marks. Fails closed: any
 /// content that cannot be decoded is returned as an error, never as an empty finding list.
@@ -96,34 +110,26 @@ pub fn audit_redactions(doc: &Document) -> Result<Vec<AuditFinding>, AuditError>
     let mut out = Vec::new();
     for (n, page) in pdfcraft_model::pages(doc).iter().enumerate() {
         let lines = pdfcraft_edit::text_lines(doc, n).map_err(|e| AuditError::Text(n, e.to_string()))?;
-        // 1. Opaque filled rectangles over extractable text.
+        // 1. Opaque rectangles (filled, or painted by a thick stroke) over extractable text.
         for r in cover::filled_rects(doc, &page.dict)? {
-            let mut covered = String::new();
-            for line in &lines {
-                if is_cover(&r, line) {
-                    if !covered.is_empty() {
-                        covered.push(' ');
-                    }
-                    covered.push_str(line.text.trim());
+            for kind in [FindingKind::CoveredText, FindingKind::HiddenUnderWhite] {
+                let covered = joined(lines.iter().filter(|line| cover_kind(&r, line) == Some(kind.clone())));
+                if !covered.is_empty() {
+                    out.push(AuditFinding { page: n, kind, rect: r.rect, covered_text: covered });
                 }
-            }
-            if !covered.trim().is_empty() {
-                out.push(AuditFinding { page: n, kind: FindingKind::CoveredText, rect: r.rect, covered_text: covered });
             }
         }
-        // 2. Redact annotations that were never applied.
-        for annot in annots(doc, &page.dict)? {
-            let mut covered = String::new();
-            for line in &lines {
-                if covers(&annot, line) {
-                    if !covered.is_empty() {
-                        covered.push(' ');
-                    }
-                    covered.push_str(line.text.trim());
-                }
-            }
-            if !covered.trim().is_empty() {
-                out.push(AuditFinding { page: n, kind: FindingKind::UnappliedMark, rect: annot, covered_text: covered });
+        // 2. Redact annotations that were never applied, and highlights dark enough to hide the
+        // text under them (annotations are drawn over the page's content).
+        for mark in annots(doc, &page.dict)? {
+            let (kind, hides) = match mark.kind {
+                Mark::Redact => (FindingKind::UnappliedMark, None),
+                Mark::Highlight(rgb) => (FindingKind::CoveredText, Some(rgb)),
+            };
+            let covered =
+                joined(lines.iter().filter(|line| covers(&mark.rect, line) && hides.is_none_or(|rgb| contrast(line.color, rgb) < COVER_CONTRAST)));
+            if !covered.is_empty() {
+                out.push(AuditFinding { page: n, kind, rect: mark.rect, covered_text: covered });
             }
         }
     }
@@ -136,6 +142,31 @@ pub fn audit_redactions(doc: &Document) -> Result<Vec<AuditFinding>, AuditError>
 /// contrast check and are not flagged.
 fn is_cover(rect: &cover::FilledRect, line: &TextLine) -> bool {
     rect.pos > line.paint_pos() && covers(&rect.rect, line) && contrast(line.color, rect.rgb) < COVER_CONTRAST
+}
+
+/// The text of `lines`, trimmed and joined by spaces (empty when nothing is left).
+fn joined<'a>(lines: impl Iterator<Item = &'a TextLine>) -> String {
+    let mut covered = String::new();
+    for line in lines {
+        if !covered.is_empty() {
+            covered.push(' ');
+        }
+        covered.push_str(line.text.trim());
+    }
+    covered.trim().to_string()
+}
+
+/// How a painted rectangle hides a text line, if it does: dark enough to be a cover
+/// ([`is_cover`]), or white or nearly so over dark text, which is gone under it. Light covers
+/// in between (table shading, highlights) are not flagged.
+fn cover_kind(rect: &cover::FilledRect, line: &TextLine) -> Option<FindingKind> {
+    if is_cover(rect, line) {
+        Some(FindingKind::CoveredText)
+    } else if rect.pos > line.paint_pos() && covers(&rect.rect, line) && luminance(rect.rgb) >= WHITE_LUMINANCE {
+        Some(FindingKind::HiddenUnderWhite)
+    } else {
+        None
+    }
 }
 
 /// Does `cover` hide a substantial part of what `line` draws? Two ways, either is enough:
@@ -182,9 +213,23 @@ fn contrast(a: [f64; 3], b: [f64; 3]) -> f64 {
     (hi + 0.05) / (lo + 0.05)
 }
 
-/// Rectangles of `/Redact` annotations on a page (unrotated user space). A missing `/Annots`
-/// means no marks; a malformed one fails the audit rather than silently passing.
-fn annots(doc: &Document, page: &Dict) -> Result<Vec<[f64; 4]>, AuditError> {
+/// An annotation the audit looks at.
+enum Mark {
+    Redact,
+    /// An opaque highlight, with its color.
+    Highlight([f64; 3]),
+}
+
+struct Annot {
+    /// `/Rect`, normalized, in unrotated user space.
+    rect: [f64; 4],
+    kind: Mark,
+}
+
+/// The `/Redact` annotations on a page, and the `/Highlight` ones shown opaque with a color
+/// (unrotated user space). A missing `/Annots` means no marks; a malformed one fails the audit
+/// rather than silently passing.
+fn annots(doc: &Document, page: &Dict) -> Result<Vec<Annot>, AuditError> {
     let Some(a) = page.get(b"Annots") else { return Ok(Vec::new()) };
     let resolved = doc.resolve(a);
     let items: Vec<pdfcraft_cos::Object> = match &*resolved {
@@ -198,15 +243,37 @@ fn annots(doc: &Document, page: &Dict) -> Result<Vec<[f64; 4]>, AuditError> {
             pdfcraft_cos::Object::Dict(d) => d.clone(),
             _ => continue,
         };
-        if dict.name(b"Subtype") != Some(b"Redact") {
+        let nums = |key: &[u8]| -> Vec<f64> {
+            dict.get(key)
+                .map(|r| doc.resolve(r))
+                .and_then(|r| r.as_array().map(|arr| arr.iter().filter_map(|o| doc.resolve(o).as_f64()).collect()))
+                .unwrap_or_default()
+        };
+        // Hidden or NoView: not drawn, so hiding nothing.
+        let flags = dict.get(b"F").and_then(|f| doc.resolve(f).as_int()).unwrap_or(0);
+        if flags & (2 | 32) != 0 {
             continue;
         }
-        let v: Vec<f64> = match dict.get(b"Rect") {
-            None => continue,
-            Some(r) => doc.resolve(r).as_array().map(|arr| arr.iter().filter_map(|o| doc.resolve(o).as_f64()).collect()).unwrap_or_default(),
+        let kind = match dict.name(b"Subtype") {
+            Some(b"Redact") => Mark::Redact,
+            Some(b"Highlight") => {
+                let alpha = dict.get(b"CA").and_then(|a| doc.resolve(a).as_f64()).unwrap_or(1.0);
+                let rgb = match nums(b"C").as_slice() {
+                    [g] => [*g, *g, *g],
+                    [r, g, b] => [*r, *g, *b],
+                    [c, m, y, k] => [(1.0 - c) * (1.0 - k), (1.0 - m) * (1.0 - k), (1.0 - y) * (1.0 - k)],
+                    _ => continue, // no color: drawn transparent
+                };
+                if alpha.is_nan() || alpha < 1.0 || rgb.iter().any(|v| !v.is_finite()) {
+                    continue;
+                }
+                Mark::Highlight(rgb.map(|v| v.clamp(0.0, 1.0)))
+            }
+            _ => continue,
         };
+        let v = nums(b"Rect");
         if v.len() == 4 && v.iter().all(|x| x.is_finite()) {
-            out.push([v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3])]);
+            out.push(Annot { rect: [v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3])], kind });
         }
     }
     Ok(out)

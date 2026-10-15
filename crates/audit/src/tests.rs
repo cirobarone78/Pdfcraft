@@ -194,12 +194,13 @@ fn light_shading_after_text_is_not_flagged() {
 #[test]
 fn graphics_state_carries_across_streams() {
     // The first stream sets a white fill after the text; the second stream's rectangle over
-    // the text is therefore white, not the default black: no finding. Without the carry fix
-    // the rectangle would default to black and flag.
+    // the text is therefore white, not the default black: hidden under white, not a dark
+    // cover. Without the carry fix the rectangle would default to black and flag as one.
     let s1 = b"BT /F1 24 Tf 100 700 Td (SECRET DATA 123) Tj ET\n1 g\n";
     let s2 = b"100 688 220 32 re f\n";
     let findings = audit_redactions(&open(two_streams(s1, s2))).expect("audit must run");
-    assert!(findings.is_empty(), "{findings:?}");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].kind, FindingKind::HiddenUnderWhite, "white, as the first stream set, not the default black");
 }
 
 #[test]
@@ -375,6 +376,7 @@ fn finding_kind_ids_are_stable() {
     // formats). They must not change; add a variant instead of renaming.
     assert_eq!(FindingKind::CoveredText.id(), "covered-text");
     assert_eq!(FindingKind::UnappliedMark.id(), "unapplied-mark");
+    assert_eq!(FindingKind::HiddenUnderWhite.id(), "hidden-under-white");
 }
 
 #[test]
@@ -456,4 +458,83 @@ fn forms_nested_past_depth_limit_fail_closed() {
     // page clean with a possible cover left unseen.
     let result = audit_redactions(&open(nested_forms(33)));
     assert!(matches!(result, Err(crate::AuditError::TooDeep)), "{result:?}");
+}
+
+/// #2385: a thick black stroke along the text (a "marker" line) paints the same rectangle a
+/// filled one would, and a white one whites the text out; a hairline doesn't hide it, a
+/// translucent stroke doesn't either, and a stroked rectangle only outlines.
+#[test]
+fn thick_stroke_over_text_is_a_cover() {
+    let text = &b"BT /F1 14 Tf 72 700 Td (IBAN IT60X0542811101000000123456) Tj ET\n"[..];
+    let audit = |cover: &[u8]| audit_redactions(&open(one_page(&[text, cover].concat(), ""))).expect("audit must run");
+    let findings = audit(b"0 G 20 w 70 705 m 400 705 l S\n");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!((findings[0].kind.clone(), findings[0].rect), (FindingKind::CoveredText, [70.0, 695.0, 400.0, 715.0]));
+    assert!(findings[0].covered_text.contains("IBAN"), "{:?}", findings[0].covered_text);
+    // Fill and stroke together, and a vertical marker across the first characters.
+    assert_eq!(audit(b"0 G 20 w 70 705 m 400 705 l B\n").len(), 1);
+    assert!(audit(b"0 G 20 w 80 690 m 80 720 l S\n").is_empty(), "a vertical stroke hides only the first letter");
+    for not_a_cover in [&b"0 G 1 w 70 705 m 400 705 l S\n"[..], b"0 G 20 w 70 695 330 20 re S\n"] {
+        assert!(audit(not_a_cover).is_empty(), "{:?}", String::from_utf8_lossy(not_a_cover));
+    }
+    // A white marker whites the text out, like a white rectangle.
+    let findings = audit(b"1 G 20 w 70 705 m 400 705 l S\n");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].kind, FindingKind::HiddenUnderWhite);
+    // A translucent stroke (`/CA`) is not a cover; `/ca` does not apply to strokes.
+    let content = [&b"BT /F1 14 Tf 72 700 Td (IBAN IT60X0542811101000000123456) Tj ET\n"[..], b"/GS1 gs 0 G 20 w 70 705 m 400 705 l S\n"].concat();
+    for (state, found) in [("<< /Type /ExtGState /CA 0.5 >>", 0), ("<< /Type /ExtGState /ca 0.5 >>", 1)] {
+        let mut b = Builder::new();
+        b.add("<< /Type /Catalog /Pages 2 0 R >>");
+        b.add("<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /ExtGState << /GS1 6 0 R >> >> >>");
+        b.add_stream(&content);
+        b.add(FONT);
+        b.add(state);
+        assert_eq!(audit_redactions(&open(b.build())).expect("audit must run").len(), found, "{state}");
+    }
+}
+
+/// #2385: a black, opaque Highlight annotation over the text hides it like a cover; a yellow one
+/// or a translucent one doesn't, and a hidden one isn't drawn at all.
+#[test]
+fn black_highlight_annotation_over_text_is_a_cover() {
+    let content = b"BT /F1 14 Tf 72 700 Td (IBAN IT60X0542811101000000123456) Tj ET\n";
+    let audit = |extra: &str| {
+        let mut b = Builder::new();
+        b.add("<< /Type /Catalog /Pages 2 0 R >>");
+        b.add("<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Annots [6 0 R] >>");
+        b.add_stream(content);
+        b.add(FONT);
+        b.add(&format!("<< /Type /Annot /Subtype /Highlight /Rect [70 695 400 715] /F 4 /QuadPoints [70 715 400 715 70 695 400 695] {extra} >>"));
+        audit_redactions(&open(b.build())).expect("audit must run")
+    };
+    let findings = audit("/C [0 0 0]");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!((findings[0].kind.clone(), findings[0].rect), (FindingKind::CoveredText, [70.0, 695.0, 400.0, 715.0]));
+    assert!(findings[0].covered_text.contains("IBAN"), "{:?}", findings[0].covered_text);
+    assert_eq!(audit("/C [0]").len(), 1, "a gray level");
+    for not_a_cover in ["/C [1 1 0]", "/C [0 0 0] /CA 0.5", "/C [0 0 0] /F 2", ""] {
+        assert!(audit(not_a_cover).is_empty(), "{not_a_cover}");
+    }
+}
+
+/// #2385: an opaque white rectangle painted after dark text makes it invisible, the way a form is
+/// "whited out"; that is its own kind, apart from the dark covers, so callers can decide. Light
+/// shading (`0.9 g`) stays unflagged, as before.
+#[test]
+fn white_rectangle_over_text_is_reported_as_hidden_under_white() {
+    let text = &b"BT /F1 14 Tf 72 700 Td (IBAN IT60X0542811101000000123456) Tj ET\n"[..];
+    let audit = |cover: &[u8]| audit_redactions(&open(one_page(&[text, cover].concat(), ""))).expect("audit must run");
+    let findings = audit(b"1 g 70 695 330 20 re f\n");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!((findings[0].kind.clone(), findings[0].rect), (FindingKind::HiddenUnderWhite, [70.0, 695.0, 400.0, 715.0]));
+    assert_eq!(findings[0].kind.clone().id(), "hidden-under-white");
+    assert!(findings[0].covered_text.contains("IBAN"), "{:?}", findings[0].covered_text);
+    assert!(audit(b"0.9 g 70 695 330 20 re f\n").is_empty(), "shading");
+    assert!(
+        audit(b"1 g 70 695 330 20 re f BT /F1 14 Tf 72 700 Td (IBAN IT60X0542811101000000123456) Tj ET\n").len() == 1,
+        "the second copy of the text is drawn after the white"
+    );
 }

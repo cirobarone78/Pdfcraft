@@ -3,10 +3,12 @@
 //! This is the geometric half of the faux-redaction audit: a rectangle filled with an opaque
 //! color (`re` + `f`) is the classic way a "redaction" is faked. A single closed `m`/`l` subpath
 //! whose four corners form an axis-aligned rectangle in user space is the same shape and counts
-//! too (#1510). Graphics state tracked here is deliberately small: the CTM stack (`q`/`Q`/`cm`),
-//! the non-stroking color (`g`/`rg`/`k`) and the non-stroking alpha from ExtGState (`gs` reading
-//! `/ca`). Form XObjects are followed read-only with a depth cap. Anything fancier (other filled paths, shadings, patterns) is
-//! out of scope and documented as such.
+//! too (#1510). A single `m`/`l` segment along an axis, stroked (`S`) wide enough to blot the text
+//! out ("marker" style), counts as the rectangle the stroke paints (#2385). Graphics state tracked
+//! here is deliberately small: the CTM stack (`q`/`Q`/`cm`), the colors (`g`/`rg`/`k` and
+//! `G`/`RG`/`K`), the line width (`w`) and the alphas from ExtGState (`gs` reading `/ca` and
+//! `/CA`). Form XObjects are followed read-only with a depth cap. Anything fancier (other filled
+//! paths, slanted or bent strokes, shadings, patterns) is out of scope and documented as such.
 //!
 //! Paint order: a page's content streams are one stream in pieces (ISO 32000-2 §7.8.2), so they
 //! are parsed joined and walked once with a single graphics state — state set in an earlier
@@ -27,12 +29,12 @@ const MAX_DEPTH: usize = 32;
 /// Hitting it fails the audit: a truncated walk must never report "clean".
 const MAX_OPS: usize = 2_000_000;
 
-/// One opaque filled rectangle, in page user space.
+/// One opaque filled rectangle (or a stroke that paints one), in page user space.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FilledRect {
     /// `[x0, y0, x1, y1]`, normalized so `x0 <= x1` and `y0 <= y1`.
     pub rect: [f64; 4],
-    /// The fill color as sRGB-ish `[r, g, b]` (CMYK is converted approximately).
+    /// The paint color as sRGB-ish `[r, g, b]` (CMYK is converted approximately).
     pub rgb: [f64; 3],
     /// Paint position: `(content-stream index, operator index in the joined stream)`.
     /// Rectangles inside a form XObject carry the `Do` operator's position.
@@ -44,6 +46,10 @@ struct Gs {
     ctm: Matrix,
     fill: [f64; 3],
     alpha: f64,
+    stroke: [f64; 3],
+    stroke_alpha: f64,
+    /// Line width, in the space the path is drawn in.
+    width: f64,
 }
 
 /// The path under construction, as far as the audit cares about it.
@@ -64,6 +70,27 @@ impl Path {
             Path::Rect(r) => Some(r),
             Path::Lines(pts, _) => lines_rect(pts),
             Path::Empty | Path::Other => None,
+        }
+    }
+
+    /// The rectangle a stroke of this path paints, if the path is one segment along an axis: the
+    /// segment widened by half the line width each side (caps are not counted). The width is
+    /// taken through the CTM's scale, which is exact for the axis-aligned CTMs this covers.
+    fn stroked_rect(&self, gs: &Gs) -> Option<[f64; 4]> {
+        const EPS: f64 = 1e-6;
+        let Path::Lines(pts, _) = self else { return None };
+        let [a, b] = <[[f64; 2]; 2]>::try_from(pts.as_slice()).ok()?;
+        let [m0, m1, m2, m3, ..] = gs.ctm.0;
+        let half = gs.width * (m0 * m3 - m1 * m2).abs().sqrt() / 2.0;
+        if half.is_nan() || half <= EPS {
+            return None;
+        }
+        if (a[1] - b[1]).abs() <= EPS && (a[0] - b[0]).abs() > EPS {
+            Some([a[0].min(b[0]), a[1] - half, a[0].max(b[0]), a[1] + half])
+        } else if (a[0] - b[0]).abs() <= EPS && (a[1] - b[1]).abs() > EPS {
+            Some([a[0] - half, a[1].min(b[1]), a[0] + half, a[1].max(b[1])])
+        } else {
+            None
         }
     }
 }
@@ -100,7 +127,7 @@ fn lines_rect(mut pts: Vec<[f64; 2]>) -> Option<[f64; 4]> {
 
 impl Default for Gs {
     fn default() -> Self {
-        Gs { ctm: Matrix::IDENTITY, fill: [0.0, 0.0, 0.0], alpha: 1.0 }
+        Gs { ctm: Matrix::IDENTITY, fill: [0.0, 0.0, 0.0], alpha: 1.0, stroke: [0.0, 0.0, 0.0], stroke_alpha: 1.0, width: 1.0 }
     }
 }
 
@@ -162,31 +189,36 @@ impl<'a> Walker<'a> {
                         path = Path::Other;
                     }
                 }
-                b"g" => {
+                b"g" | b"G" => {
                     if let Some(v) = op.num(0).filter(|v| v.is_finite()) {
                         let v = v.clamp(0.0, 1.0);
-                        gs.fill = [v, v, v];
+                        *gs.color(op.op[0] == b'G') = [v, v, v];
                     }
                 }
-                b"rg" => {
+                b"rg" | b"RG" => {
                     if let Some([r, g, b]) = op.nums::<3>()
                         && [r, g, b].iter().all(|v| v.is_finite())
                     {
-                        gs.fill = [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)];
+                        *gs.color(op.op[0] == b'R') = [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)];
                     }
                 }
-                b"k" => {
+                b"k" | b"K" => {
                     if let Some([c, m, y, k]) = op.nums::<4>()
                         && [c, m, y, k].iter().all(|v| v.is_finite())
                     {
                         // Naive CMYK -> RGB; good enough to tell black from white.
                         let (c, m, y, k) = (c.clamp(0.0, 1.0), m.clamp(0.0, 1.0), y.clamp(0.0, 1.0), k.clamp(0.0, 1.0));
-                        gs.fill = [(1.0 - c) * (1.0 - k), (1.0 - m) * (1.0 - k), (1.0 - y) * (1.0 - k)];
+                        *gs.color(op.op[0] == b'K') = [(1.0 - c) * (1.0 - k), (1.0 - m) * (1.0 - k), (1.0 - y) * (1.0 - k)];
+                    }
+                }
+                b"w" => {
+                    if let Some(v) = op.num(0).filter(|v| v.is_finite() && *v >= 0.0) {
+                        gs.width = v;
                     }
                 }
                 b"gs" => {
                     if let Some(name) = op.name(0) {
-                        gs.alpha = ext_alpha(self.doc, resources, name);
+                        (gs.alpha, gs.stroke_alpha) = ext_alphas(self.doc, resources, name);
                     }
                 }
                 b"re" => {
@@ -226,13 +258,27 @@ impl<'a> Walker<'a> {
                 }
                 // `b`/`b*` close the path before filling it, which the fill does anyway.
                 b"f" | b"F" | b"f*" | b"B" | b"B*" | b"b" | b"b*" => {
-                    if let Some(r) = std::mem::replace(&mut path, Path::Empty).rect()
+                    let done = std::mem::replace(&mut path, Path::Empty);
+                    if matches!(op.op.as_slice(), b"B" | b"B*" | b"b" | b"b*")
+                        && let Some(r) = done.stroked_rect(gs)
+                        && gs.stroke_alpha >= 1.0
+                    {
+                        self.out.push(FilledRect { rect: r, rgb: gs.stroke, pos });
+                    }
+                    if let Some(r) = done.rect()
                         && gs.alpha >= 1.0
                     {
                         self.out.push(FilledRect { rect: r, rgb: gs.fill, pos });
                     }
                 }
-                b"S" | b"s" | b"n" => path = Path::Empty,
+                b"S" | b"s" => {
+                    if let Some(r) = std::mem::replace(&mut path, Path::Empty).stroked_rect(gs)
+                        && gs.stroke_alpha >= 1.0
+                    {
+                        self.out.push(FilledRect { rect: r, rgb: gs.stroke, pos });
+                    }
+                }
+                b"n" => path = Path::Empty,
                 b"c" | b"v" | b"y" | b"W" | b"W*" => path = Path::Other,
                 b"Do" => {
                     if let Some(name) = op.name(0) {
@@ -289,16 +335,28 @@ fn user_point(gs: &Gs, op: &Op) -> Option<[f64; 2]> {
     Some([x, y])
 }
 
-/// The non-stroking alpha (`/ca`) of a named ExtGState, defaulting to opaque.
-fn ext_alpha(doc: &Document, resources: &Dict, name: &[u8]) -> f64 {
-    let alpha = resources
+impl Gs {
+    /// The stroking or the non-stroking color.
+    fn color(&mut self, stroking: bool) -> &mut [f64; 3] {
+        if stroking { &mut self.stroke } else { &mut self.fill }
+    }
+}
+
+/// The non-stroking and stroking alphas (`/ca`, `/CA`) of a named ExtGState, each defaulting to
+/// opaque.
+fn ext_alphas(doc: &Document, resources: &Dict, name: &[u8]) -> (f64, f64) {
+    let state = resources
         .get(b"ExtGState")
         .map(|o| doc.resolve(o))
         .and_then(|o| o.as_dict().cloned())
         .and_then(|d| d.get(name).map(|o| doc.resolve(o)))
         .and_then(|o| o.as_dict().cloned())
-        .and_then(|d| d.get(b"ca").map(|o| doc.resolve(o)).and_then(|o| o.as_f64()));
-    alpha.filter(|a| a.is_finite()).map(|a| a.clamp(0.0, 1.0)).unwrap_or(1.0)
+        .unwrap_or_default();
+    let alpha = |key: &[u8]| {
+        let a = state.get(key).map(|o| doc.resolve(o)).and_then(|o| o.as_f64());
+        a.filter(|a| a.is_finite()).map(|a| a.clamp(0.0, 1.0)).unwrap_or(1.0)
+    };
+    (alpha(b"ca"), alpha(b"CA"))
 }
 
 /// Every opaque filled rectangle drawn by a page's content (and its form XObjects), with paint
