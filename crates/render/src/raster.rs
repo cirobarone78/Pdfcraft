@@ -6049,6 +6049,81 @@ endstream endobj
         assert_eq!(rgb_at(&out.rgba, w, 100, 35), [255, 0, 0]);
     }
 
+    /// The decoded-image cache keyed every decode by the size the image is drawn at, but only
+    /// a JPX stream decodes differently for a size: a scan was decoded again at every zoom step
+    /// and kept once per zoom level (vendored hayro-interpret patch 31). An image drawn at five
+    /// sizes is now decoded once, unless JPX decodes it or its soft mask.
+    #[test]
+    fn decoded_images_serve_every_size_they_are_drawn_at() {
+        use hayro::hayro_interpret::font::Glyph;
+        use hayro::hayro_interpret::hayro_syntax::Pdf;
+        use hayro::hayro_interpret::{
+            BlendMode, ClipPath, Context, Device, GlyphDrawMode, Image, InterpreterCache, Paint, PathDrawMode, SoftMask, TransformExt, interpret_page,
+        };
+        use kurbo::{Affine, BezPath, Rect};
+        use std::io::Write;
+
+        /// Asks for every raster image at the size it is drawn at, as the renderer does, and
+        /// counts the decoded images it was handed.
+        #[derive(Default)]
+        struct Draws(usize);
+        impl<'a> Device<'a> for Draws {
+            fn set_soft_mask(&mut self, _: Option<SoftMask<'a>>) {}
+            fn set_blend_mode(&mut self, _: BlendMode) {}
+            fn draw_path(&mut self, _: &BezPath, _: Affine, _: &Paint<'a>, _: &PathDrawMode) {}
+            fn push_clip_path(&mut self, _: &ClipPath) {}
+            fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
+            fn draw_glyph(&mut self, _: &Glyph<'a>, _: Affine, _: Affine, _: &Paint<'a>, _: &GlyphDrawMode) {}
+            fn draw_image(&mut self, image: Image<'a, '_>, transform: Affine) {
+                let [a, b, c, d, ..] = transform.as_coeffs();
+                let target = ((a.hypot(b) * f64::from(image.width())).ceil() as u32, (c.hypot(d) * f64::from(image.height())).ceil() as u32);
+                if let Image::Raster(r) = image {
+                    r.with_rgba(|_, _| self.0 += 1, Some(target));
+                }
+            }
+            fn pop_clip_path(&mut self) {}
+            fn pop_transparency_group(&mut self) {}
+        }
+
+        let flate = |data: &[u8]| {
+            let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+            z.write_all(data).unwrap();
+            z.finish().unwrap()
+        };
+        let pixels = flate(&(0..64 * 64 * 3).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+        let image = |extra: &str| {
+            format!(
+                "<< /Type /XObject /Subtype /Image /Width 64 /Height 64 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode {extra}/Length {} >>",
+                pixels.len()
+            )
+        };
+        let (plain, jpx_masked) = (image(""), image("/SMask 7 0 R "));
+        let jpx_mask =
+            "<< /Type /XObject /Subtype /Image /Width 64 /Height 64 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /JPXDecode /Length 4 >>";
+        // `name` drawn at five sizes, from 10 to 40 pt square.
+        let decodes = |name: &str| {
+            let content = [(10, 0, 0), (20, 12, 0), (30, 34, 0), (40, 66, 0), (25, 100, 40)]
+                .map(|(s, x, y)| format!("q {s} 0 0 {s} {x} {y} cm /{name} Do Q"))
+                .join(" ");
+            let bytes = image_cache_pdf(
+                &content,
+                "<< /XObject << /A 5 0 R /B 6 0 R >> >>",
+                &[(&plain, &pixels), (&jpx_masked, &pixels), (jpx_mask, b"\0\0\0\0")],
+            );
+            let parsed = Pdf::new(Arc::new(bytes)).expect("parses");
+            let page = &parsed.pages()[0];
+            let cache = InterpreterCache::new();
+            let initial = page.initial_transform(true).to_kurbo();
+            let mut ctx = Context::new(initial, Rect::new(0.0, 0.0, 130.0, 70.0), &cache, page.xref(), InterpreterSettings::default());
+            let mut device = Draws::default();
+            interpret_page(page, &mut ctx, &mut device);
+            assert_eq!(device.0, 5, "every draw of /{name} was handed its pixels");
+            cache.decoded_image_decodes()
+        };
+        assert_eq!(decodes("A"), 1, "a Flate image decodes the same at every size");
+        assert_eq!(decodes("B"), 5, "a JPX soft mask decodes for the size it is drawn at");
+    }
+
     /// Render `pdf`'s first page at 72 dpi with no time limit beyond the test's own.
     fn render_first_page(pdf: Vec<u8>) -> RenderedPage {
         let mut r = PageRenderer::new(Arc::new(pdf), RenderConfig::default());
