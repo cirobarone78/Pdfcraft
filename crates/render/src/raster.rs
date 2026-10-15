@@ -4813,6 +4813,54 @@ trailer << /Root 1 0 R >>
         assert!(middle != [255, 255, 255, 255] && middle[3] == 255, "a small patch is shaded: {middle:?}");
     }
 
+    /// Coons and tensor-product patches put each corner's colour at its corner and blend them
+    /// in between. Patch 32 interpolates each point of a patch's 20 × 20 triangle grid once
+    /// instead of once per cell touching it, and moves vertices instead of copying them; these
+    /// colours (taken before that change) pin that every vertex still gets its own point's colour.
+    #[test]
+    fn patch_meshes_keep_their_corner_colours() {
+        // Points on a 4 × 4 grid over the 40 pt page, in stream order: the 12 boundary points
+        // (both patch types), then a tensor patch's four interior ones.
+        let grid = |x: u8, y: u8| [x * 85, y * 85];
+        let boundary = [(0, 0), (0, 1), (0, 2), (0, 3), (1, 3), (2, 3), (3, 3), (3, 2), (3, 1), (3, 0), (2, 0), (1, 0)];
+        let interior = [(1, 1), (1, 2), (2, 2), (2, 1)];
+        let colours = [255u8, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0];
+        let patch = |points: &[(u8, u8)]| {
+            let mut data = vec![0u8];
+            data.extend(points.iter().flat_map(|(x, y)| grid(*x, *y)));
+            data.extend_from_slice(&colours);
+            data
+        };
+        let render = |shading_type: u8, data: Vec<u8>| {
+            let content = b"/Sh0 sh";
+            let mut pdf = b"%PDF-1.7\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 40 40] /Contents 4 0 R /Resources << /Shading << /Sh0 5 0 R >> >> >> endobj\n".to_vec();
+            pdf.extend_from_slice(format!("4 0 obj << /Length {} >> stream\n", content.len()).as_bytes());
+            pdf.extend_from_slice(content);
+            pdf.extend_from_slice(format!("\nendstream endobj\n5 0 obj << /ShadingType {shading_type} /ColorSpace /DeviceRGB /BitsPerCoordinate 8 /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 40 0 40 0 1 0 1 0 1] /Length {} >> stream\n", data.len()).as_bytes());
+            pdf.extend_from_slice(&data);
+            pdf.extend_from_slice(b"\nendstream endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n");
+            render_first_page(pdf)
+        };
+        let coons = render(6, patch(&boundary));
+        let tensor = render(7, patch(&[&boundary[..], &interior[..]].concat()));
+        // Near each corner (top-left, bottom-left, bottom-right, top-right in the raster), the
+        // centre, and a point between them.
+        let want = [
+            ((5, 5), [32, 199, 28]),
+            ((5, 34), [217, 61, 5]),
+            ((34, 34), [217, 190, 32]),
+            ((34, 5), [32, 61, 190]),
+            ((20, 20), [127, 128, 64]),
+            ((12, 27), [172, 110, 25]),
+        ];
+        for (what, page) in [("Coons", &coons), ("tensor", &tensor)] {
+            for ((x, y), colour) in want {
+                let got = rgb_at(&page.rgba, 40, x, y);
+                assert!(got.iter().zip(colour).all(|(g, w)| g.abs_diff(w) <= 1), "{what} patch at ({x}, {y}): got {got:?}, want {colour:?}");
+            }
+        }
+    }
+
     /// The other half of the mesh-shading patch: ten thousand triangles that each cover half
     /// of this 1000 × 1000 canvas walked their bounding boxes ten thousand times over (ten
     /// billion visits). The visit budget stops that work at eight per pixel plus four per
