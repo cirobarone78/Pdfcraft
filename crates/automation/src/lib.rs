@@ -87,6 +87,8 @@ const DEFAULT_DPI: f64 = 96.0;
 const MAX_DPI: f64 = 600.0;
 /// How far a watermark may be moved from the page centre, in points (a page is at most 14,400).
 const WATERMARK_MAX_OFFSET: f64 = 20_000.0;
+/// `doc_optimize` with `target_bytes`: (max target ppi, max JPEG quality) per extra attempt, mildest first.
+const TARGET_LADDER: [(f64, u8); 5] = [(110.0, 45), (96.0, 35), (72.0, 28), (54.0, 20), (36.0, 12)];
 
 /// Bookmarks in one page of the bookmark list, by default and at most.
 const BOOKMARK_PAGE: usize = 100;
@@ -1050,10 +1052,52 @@ impl Automation {
                 })
                 .collect::<Result<_>>()?,
         };
-        let (bytes, r) = self.session.optimized_bytes(id, &settings, &discard).map_err(failed)?;
+        let target = match a.opt_int("target_bytes")? {
+            None => None,
+            Some(t) if t >= 1 => Some(t as usize),
+            Some(t) => return Err(ToolError::InvalidArgs(format!("target_bytes must be at least 1, not {t}"))),
+        };
+        let (mut bytes, mut r) = self.session.optimized_bytes(id, &settings, &discard).map_err(failed)?;
+        let mut attempts = 1;
+        let mut step_used = 0;
+        if let Some(t) = target {
+            // Stronger image settings, one rung per attempt, until the copy fits. Every attempt
+            // starts from the open document, so a failed one changes nothing; the number of
+            // attempts is fixed. The smallest copy is kept if none fits.
+            for (k, &(ppi, quality)) in TARGET_LADDER.iter().enumerate() {
+                if bytes.len() <= t {
+                    break;
+                }
+                let mut s = settings.clone();
+                for img in [&mut s.color, &mut s.gray] {
+                    img.downsample = true;
+                    img.target_ppi = img.target_ppi.min(ppi);
+                    img.above_ppi = img.above_ppi.min(ppi * 1.5).max(img.target_ppi);
+                    img.compression = match img.compression {
+                        Compression::Jpeg(q) => Compression::Jpeg(q.min(quality)),
+                        _ => Compression::Jpeg(quality),
+                    };
+                }
+                let (b2, r2) = self.session.optimized_bytes(id, &s, &discard).map_err(failed)?;
+                attempts += 1;
+                if b2.len() < bytes.len() {
+                    (bytes, r, step_used) = (b2, r2, k + 1);
+                }
+            }
+        }
         write_atomic(&path, &bytes)?;
         let o = &r.optimize;
-        Ok(json!({
+        let mut extra = json!({});
+        if let Some(t) = target {
+            let (ppi, quality) = step_used.checked_sub(1).and_then(|k| TARGET_LADDER.get(k)).copied().unzip();
+            extra = json!({
+                "target_bytes": t,
+                "target_reached": bytes.len() <= t,
+                "attempts": attempts,
+                "target_settings": { "step": step_used, "max_ppi": ppi, "max_jpeg_quality": quality },
+            });
+        }
+        let mut out = json!({
             "path": path.to_string_lossy(),
             "bytes_before": before,
             "bytes_after": bytes.len(),
@@ -1072,7 +1116,11 @@ impl Automation {
             "unused_xobjects": o.unused_xobjects,
             "merged_objects": r.merged,
             "discarded": r.discarded.iter().map(|(h, n)| json!({ "category": h.id(), "count": n })).collect::<Vec<_>>(),
-        }))
+        });
+        if let (Some(o), Some(e)) = (out.as_object_mut(), extra.as_object()) {
+            o.extend(e.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        Ok(out)
     }
 
     /// A watermark or background picture: `file` (an image or a PDF) and `file_page` (1-based).
