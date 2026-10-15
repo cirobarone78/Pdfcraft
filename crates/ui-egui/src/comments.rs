@@ -395,8 +395,11 @@ pub enum ComposerKind {
     Caret {
         size: f64,
     },
-    /// Replace the selected text (`CommentView::replace` holds the quads).
+    /// Replace the selected text (`CommentView::text_quads` holds the quads).
     Replace,
+    /// Comment on the selected text (`CommentView::text_quads` holds the quads): posting
+    /// highlights the text with the comment as its contents.
+    TextComment,
     /// Edit the text of the comment at this index on the composer's page.
     Edit(usize),
 }
@@ -468,6 +471,8 @@ pub struct CommentView {
     pub editing: Option<(usize, usize, String)>,
     /// The panel should scroll the selected card into view.
     pub reveal: bool,
+    /// A comment with text was clicked: open the Comments panel on it, even if it was closed.
+    pub(crate) open_panel: bool,
     /// The "Add a comment" box at the top of the Comments panel.
     pub add_box: String,
     /// The Comments panel's search query (`None`: search closed).
@@ -487,8 +492,8 @@ pub struct CommentView {
     pub props_request: Option<(usize, usize)>,
     /// Make Current Properties Default was asked for: (page, index).
     pub default_request: Option<(usize, usize)>,
-    /// Replace Text: the struck-out text's quads while the replacement is typed.
-    pub replace: Option<Vec<[f64; 8]>>,
+    /// Replace Text or a comment on selected text: the text's quads while the composer is open.
+    pub text_quads: Option<Vec<[f64; 8]>>,
     /// Attach file: where the icon goes (page, top-left in user space), for the app to pick a file.
     pub attach_at: Option<(usize, [f64; 2])>,
     pub search_focus: bool,
@@ -1118,6 +1123,8 @@ fn select_input(
             Some(a) => {
                 cv.selected = Some((cx.page, a.index));
                 cv.reveal = true;
+                // An explicit click shows the comment's thread, unlike a tool opening the panel.
+                cv.open_panel |= cx.tool == QuickTool::Select && a.contents.as_deref().is_some_and(|t| !t.trim().is_empty());
                 consumed = true;
             }
             None => cv.selected = None,
@@ -1141,6 +1148,19 @@ fn select_input(
     consumed
 }
 
+/// Comment on the selected text, as in Google Drive's viewer and Acrobat's Add Note to Text: the
+/// composer opens beside the selection's last line, and posting highlights the text with the
+/// comment as its contents, in one undo step. Cancelling leaves the page as it was. Without a
+/// selection, nothing happens.
+pub(crate) fn comment_on_selection(view: &mut DocView, info: &DocInfo) {
+    let Some((page, quads)) = view.selection_quads(info) else { return };
+    let last = quads.last().copied().unwrap_or_default();
+    let at = [last[2].max(last[6]), last[1].max(last[3])];
+    view.clear_selection();
+    view.comments.text_quads = Some(quads);
+    view.comments.composer = Some(Composer { page, at, kind: ComposerKind::TextComment, text: String::new(), focus: true });
+}
+
 /// After text selection ran: a markup tool turns a finished selection into a comment; Replace
 /// Text asks for the replacement.
 pub(crate) fn page_after_text(resp: &egui::Response, cx: &PageCx<'_>, view: &mut DocView) {
@@ -1150,7 +1170,7 @@ pub(crate) fn page_after_text(resp: &egui::Response, cx: &PageCx<'_>, view: &mut
             view.clear_selection();
             let last = quads.last().copied().unwrap_or_default();
             let at = [last[2].max(last[6]), last[1].max(last[3])];
-            view.comments.replace = Some(quads);
+            view.comments.text_quads = Some(quads);
             view.comments.composer = Some(Composer { page, at, kind: ComposerKind::Replace, text: String::new(), focus: true });
         }
         return;
@@ -1171,6 +1191,20 @@ pub(crate) fn page_after_text(resp: &egui::Response, cx: &PageCx<'_>, view: &mut
 pub(crate) fn paint_page(ui: &egui::Ui, painter: &egui::Painter, cx: &PageCx<'_>, view: &DocView) {
     let cv = &view.comments;
     let pointer = ui.input(|i| i.pointer.hover_pos());
+    // The text a comment is being typed for stays marked as it was selected until it is posted.
+    if let (Some(c), Some(quads)) = (&cv.composer, &cv.text_quads)
+        && c.page == cx.page
+        && c.kind == ComposerKind::TextComment
+    {
+        for q in quads {
+            let xs = [q[0], q[2], q[4], q[6]];
+            let ys = [q[1], q[3], q[5], q[7]];
+            let (x0, x1) = (xs.iter().copied().fold(f64::MAX, f64::min), xs.iter().copied().fold(f64::MIN, f64::max));
+            let (y0, y1) = (ys.iter().copied().fold(f64::MAX, f64::min), ys.iter().copied().fold(f64::MIN, f64::max));
+            let r = cx.xf.user_rect(cx.info, cx.page, [x0 as f32, y0 as f32, x1 as f32, y1 as f32]);
+            painter.rect_filled(r, CornerRadius::same(1), Color32::from_rgba_unmultiplied(0x3A, 0x7B, 0xF0, 70));
+        }
+    }
     // A redaction mark shows its fill while the pointer is over it, as Acrobat's does, so the
     // marked area reads before anything is applied.
     if cv.gesture.is_none()
@@ -1356,6 +1390,7 @@ pub(crate) fn composer(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, 
         ComposerKind::Callout { .. } => "Callout",
         ComposerKind::Caret { .. } => "Inserted text",
         ComposerKind::Replace => "Replacement text",
+        ComposerKind::TextComment => "Add comment",
         ComposerKind::Edit(_) => "Edit comment",
     };
     let pos = pos2(anchor.x + 12.0, anchor.y);
@@ -1406,6 +1441,7 @@ pub(crate) fn composer(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, 
     });
     if cancel {
         view.comments.composer = None;
+        view.comments.text_quads = None;
         return None;
     }
     if !post {
@@ -1444,7 +1480,7 @@ pub(crate) fn composer(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, 
         }
         ComposerKind::Replace => {
             view.comments.tool_done = true;
-            let quads = view.comments.replace.take()?;
+            let quads = view.comments.text_quads.take()?;
             Some(Edit::ReplaceText {
                 page,
                 quads,
@@ -1453,6 +1489,10 @@ pub(crate) fn composer(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, 
                 strike: prefs.style(CommentTool::ReplaceText),
                 caret: prefs.style(CommentTool::Caret),
             })
+        }
+        ComposerKind::TextComment => {
+            let quads = view.comments.text_quads.take()?;
+            Some(new_comment(&cx, CommentTool::Highlight, Shape::TextMarkup { kind: Markup::Highlight, quads }, text))
         }
         ComposerKind::Caret { size } => {
             view.comments.tool_done = true;
@@ -1650,6 +1690,10 @@ pub(crate) fn context_menu(ui: &mut egui::Ui, view: &mut DocView, info: &DocInfo
             }
         }
         None => {
+            if view.selected_text().is_some_and(|t| !t.is_empty()) && ui.add_enabled(allowed, egui::Button::new(tl!("Add comment"))).clicked() {
+                comment_on_selection(view, info);
+                ui.close();
+            }
             if let Some((page, at)) = view.comments.context_at
                 && ui.add_enabled(allowed, egui::Button::new(tl!("Add a sticky note here"))).clicked()
             {

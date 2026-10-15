@@ -357,6 +357,7 @@ fn selected_text_shows_actions_and_underlines_without_changing_tools() {
     h.get_by_label("Replace text");
     h.get_by_label("Underline").click();
     h.run_steps(3);
+    settle(&mut h);
     let c = comments(&h);
     assert_eq!(c.len(), 1);
     assert_eq!(c[0].subtype, "Underline");
@@ -376,14 +377,154 @@ fn selected_text_replace_action_opens_replacement_composer() {
 }
 
 #[test]
-fn selected_text_comment_action_opens_note_composer() {
+fn selected_text_comment_action_opens_text_comment_composer() {
     let mut h = harness(|_| {});
     h.state_mut().views[0].select_text(0, 4, 8);
     h.run_steps(3);
     h.get_by_label("Add comment").click();
     h.run_steps(2);
-    assert!(matches!(h.state().views[0].comments.composer.as_ref().map(|c| &c.kind), Some(pdfcraft_ui_egui::comments::ComposerKind::Note)));
+    assert!(matches!(h.state().views[0].comments.composer.as_ref().map(|c| &c.kind), Some(pdfcraft_ui_egui::comments::ComposerKind::TextComment)));
     assert!(h.state().views[0].selected_text().is_none());
+}
+
+#[test]
+fn a_comment_on_selected_text_is_a_highlight_holding_it() {
+    let mut h = harness(|_| {});
+    h.state_mut().views[0].select_text(0, 4, 8);
+    h.run_steps(3);
+    h.get_by_label("Add comment").click();
+    h.run_steps(2);
+    assert!(comments(&h).is_empty(), "nothing is added before the comment is posted");
+    field(&h, "Add a comment").type_text("Is this the right word?");
+    h.run_steps(2);
+    h.get_by_label("Post").click();
+    h.run_steps(3);
+    let c = comments(&h);
+    assert_eq!(c.len(), 1);
+    assert_eq!(
+        (c[0].subtype.as_str(), c[0].contents.as_deref(), c[0].author.as_deref(), c[0].quads.len()),
+        ("Highlight", Some("Is this the right word?"), Some("Tester"), 1),
+        "the selected text is highlighted and the comment is the highlight's contents"
+    );
+    assert!(h.state().views[0].comments.composer.is_none());
+    assert!(h.state().views[0].comments.text_quads.is_none());
+    assert_eq!(h.state().quick_tool, QuickTool::Select);
+    let doc = h.state().session.get(h.state().views[0].id).unwrap();
+    assert_eq!(doc.can_undo(), Some("Add highlight"), "the highlight and its comment are one undo step");
+}
+
+#[test]
+fn cancelling_a_comment_on_selected_text_adds_nothing() {
+    let mut h = harness(|_| {});
+    h.state_mut().views[0].select_text(0, 4, 8);
+    h.run_steps(3);
+    h.get_by_label("Add comment").click();
+    h.run_steps(2);
+    field(&h, "Add a comment").type_text("Never mind");
+    h.run_steps(2);
+    h.get_by_label("Cancel").click();
+    h.run_steps(3);
+    assert!(comments(&h).is_empty());
+    assert!(h.state().views[0].comments.composer.is_none());
+    assert!(h.state().views[0].comments.text_quads.is_none(), "the cancelled comment's text is forgotten");
+}
+
+#[test]
+fn right_clicking_selected_text_offers_a_comment_on_it() {
+    let mut h = harness(|_| {});
+    h.state_mut().views[0].select_text(0, 4, 8);
+    // Hide the floating bar: the remaining Add comment must be in the context menu.
+    h.state_mut().quick_tool = QuickTool::Hand;
+    h.run_steps(3);
+    assert!(h.query_all_by_label("Add comment").next().is_none());
+    let at = h.state().views[0].glyph_screen_pos(0, 6).expect("text layer");
+    h.event(egui::Event::PointerMoved(at));
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed, modifiers: egui::Modifiers::NONE });
+        h.run_steps(1);
+    }
+    h.run_steps(2);
+    assert!(h.state().views[0].selected_text().is_some(), "right-clicking keeps the selection");
+    h.get_by_label("Add comment").click();
+    h.run_steps(2);
+    assert!(matches!(h.state().views[0].comments.composer.as_ref().map(|c| &c.kind), Some(pdfcraft_ui_egui::comments::ComposerKind::TextComment)));
+    field(&h, "Add a comment").type_text("Why quick?");
+    h.run_steps(2);
+    h.get_by_label("Post").click();
+    h.run_steps(3);
+    let c = comments(&h);
+    assert_eq!(c.len(), 1);
+    assert_eq!((c[0].subtype.as_str(), c[0].contents.as_deref()), ("Highlight", Some("Why quick?")));
+}
+
+#[test]
+fn right_clicking_without_selected_text_offers_no_comment_on_it() {
+    let mut h = harness(|_| {});
+    let p = at(&h, 150.0, 60.0);
+    h.event(egui::Event::PointerMoved(p));
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton { pos: p, button: egui::PointerButton::Secondary, pressed, modifiers: egui::Modifiers::NONE });
+        h.run_steps(1);
+    }
+    h.run_steps(2);
+    h.get_by_label("Add a sticky note here");
+    assert!(h.query_all_by_label("Add comment").next().is_none());
+}
+
+#[test]
+fn the_composer_for_a_comment_on_selected_text_is_titled_add_comment() {
+    let mut h = harness(|_| {});
+    h.state_mut().views[0].select_text(0, 4, 8);
+    h.run_steps(3);
+    h.get_by_label("Add comment").click();
+    h.run_steps(2);
+    assert!(h.state().views[0].comments.composer.is_some());
+    // The selection bar has gone with the selection: the label left is the composer's title.
+    h.get_by_label("Add comment");
+}
+
+/// Clicking a comment that has text shows it, even after the Comments panel was closed: the
+/// click asks for that thread, unlike a comment tool opening the panel on its own (#225).
+#[test]
+fn clicking_a_comment_with_text_opens_the_closed_comments_panel_on_its_thread() {
+    use pdfcraft_ui_egui::RightPanel;
+    let mut h = harness(|_| {});
+    h.state_mut().views[0].select_text(0, 4, 8);
+    h.run_steps(3);
+    h.get_by_label("Add comment").click();
+    h.run_steps(2);
+    field(&h, "Add a comment").type_text("Is this the right word?");
+    h.run_steps(2);
+    h.get_by_label("Post").click();
+    h.run_steps(3);
+    settle(&mut h);
+    h.state_mut().views[0].select_text(0, 10, 14);
+    h.run_steps(3);
+    h.get_by_label("Underline").click();
+    h.run_steps(3);
+    settle(&mut h);
+    let c = comments(&h);
+    assert_eq!(c.len(), 2);
+    let (commented, bare) = (&c[0], &c[1]);
+    assert_eq!((bare.contents.as_deref().unwrap_or(""), commented.contents.as_deref()), ("", Some("Is this the right word?")));
+    h.state_mut().choose_right_panel(Some(RightPanel::Comments));
+    h.state_mut().choose_right_panel(None);
+    h.run_steps(2);
+    settle(&mut h);
+    assert!(h.state().comments_panel_closed);
+    // A comment without text is only selected, as before.
+    let bare_at = h.state().views[0].glyph_screen_pos(0, 12).expect("text layer");
+    click(&mut h, bare_at);
+    assert_eq!(h.state().views[0].comments.selected, Some((0, bare.index)));
+    assert_eq!(h.state().right, None);
+    let commented_at = h.state().views[0].glyph_screen_pos(0, 6).expect("text layer");
+    click(&mut h, commented_at);
+    h.run_steps(3);
+    assert_eq!(h.state().views[0].comments.selected, Some((0, commented.index)));
+    assert_eq!(h.state().right, Some(RightPanel::Comments), "the click opens the closed panel");
+    assert!(!h.state().comments_panel_closed);
+    assert!(!h.state().views[0].comments.reveal, "the panel scrolled to the comment's card");
+    assert!(h.query_all_by_label("Is this the right word?").next().is_some(), "the thread is shown");
 }
 
 #[test]
